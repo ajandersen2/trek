@@ -49,13 +49,14 @@ export function klingonAI(state: EncounterState, shipId: string, rng: Rng): Orde
     }
   }
 
-  // Attack: turn onto the foe, manage closure rate.
+  // Attack: turn onto the foe, manage closure rate. Approach speeds are kept
+  // moderate near the target so the BoP knife-fights instead of orbiting.
   const desired = headingToward(self.pos, foe.pos)
   const turn = headingDelta(self.heading, desired)
   let throttle: number
-  if (dist > 8) throttle = 4
-  else if (dist > 3) throttle = 3
-  else throttle = 2
+  if (dist > 12) throttle = 4
+  else if (dist > 6) throttle = 2
+  else throttle = 1
 
   // Predict own post-turn facing to decide if guns bear this round.
   const clampedTurn = Math.max(-cls.agility, Math.min(cls.agility, turn))

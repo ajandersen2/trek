@@ -13,7 +13,7 @@ export const SHIP_CLASSES: Record<string, ShipClass> = {
     faction: 'federation',
     maxHull: 100,
     agility: 2,
-    maxSpeed: 10,
+    maxSpeed: 8,
     ratedPower: 10,
     // Wide 270° phaser coverage, moderate punch.
     phaser: { cosHalfArc: -0.7071067811865476, baseDamage: 12, range: 12 },
@@ -30,7 +30,7 @@ export const SHIP_CLASSES: Record<string, ShipClass> = {
     faction: 'klingon',
     maxHull: 70,
     agility: 4,
-    maxSpeed: 13,
+    maxSpeed: 11,
     ratedPower: 8,
     // Heavy disruptors in a narrow 90° forward arc.
     phaser: { cosHalfArc: 0.7071067811865476, baseDamage: 16, range: 10 },

@@ -196,10 +196,14 @@ export function resolveRound(
     })
   }
   const speedThisRound = new Map<string, number>()
+  // Movement segments this round, used to resolve fire at closest approach.
+  const segments = new Map<string, { from: Vec2; to: Vec2 }>()
+  for (const ship of s.ships) segments.set(ship.id, { from: { ...ship.pos }, to: { ...ship.pos } })
   for (const m of moves) {
     m.ship.heading = m.headingTo
     m.ship.pos = m.to
     speedThisRound.set(m.ship.id, m.speed)
+    segments.set(m.ship.id, { from: m.from, to: m.to })
     events.push({
       type: 'helm',
       shipId: m.ship.id,
@@ -346,12 +350,20 @@ export function resolveRound(
     const targetLive = s.ships.find((t) => t.id === fire.targetId)
     const targetSnap = snapshot.ships.find((t) => t.id === fire.targetId)
     if (!targetLive || !targetSnap || !targetSnap.alive || targetSnap.warpedOut) continue
-    const dist = distance(shipSnap.pos, targetSnap.pos)
+    // Both ships moved simultaneously this round: resolve the shot at their
+    // closest approach along the two flight segments, so ships exchange fire
+    // as they pass instead of jousting hopelessly past each other.
+    const shooterSeg = segments.get(ship.id)!
+    const targetSeg = segments.get(targetSnap.id)!
+    const t = closestApproachT(shooterSeg.from, shooterSeg.to, targetSeg.from, targetSeg.to)
+    const shooterPos = lerp(shooterSeg.from, shooterSeg.to, t)
+    const targetPos = lerp(targetSeg.from, targetSeg.to, t)
+    const dist = distance(shooterPos, targetPos)
     if (dist > cls.phaser.range) {
       events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'range' })
       continue
     }
-    if (!inArc(shipSnap.pos, shipSnap.heading, targetSnap.pos, cls.phaser.cosHalfArc)) {
+    if (!inArc(shooterPos, shipSnap.heading, targetPos, cls.phaser.cosHalfArc)) {
       events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'arc' })
       continue
     }
@@ -380,8 +392,8 @@ export function resolveRound(
       hit,
       damage,
       subsystem,
-      from: { ...shipSnap.pos },
-      to: { ...targetSnap.pos },
+      from: shooterPos,
+      to: targetPos,
     })
   }
   for (const shot of shots) {
@@ -401,7 +413,8 @@ export function resolveRound(
       })
       continue
     }
-    const arc = shieldArcHit(shot.target.pos, shot.target.heading, shot.shooter.pos)
+    // Shield facing evaluated at the closest-approach geometry the shot used.
+    const arc = shieldArcHit(shot.to, shot.target.heading, shot.from)
     const result = applyDamage(shot.target, arc, shot.damage, shot.subsystem, events)
     events.push({
       type: 'phaser-fire',
@@ -478,4 +491,21 @@ function closestPointOnSegment(a: Vec2, b: Vec2, p: Vec2): Vec2 {
   if (abLenSq === 0) return { ...a }
   const t = Math.max(0, Math.min(1, dot(sub(p, a), ab) / abLenSq))
   return add(a, scale(ab, t))
+}
+
+/**
+ * Time t in [0,1] at which two ships moving linearly through their round
+ * segments are closest: minimize |(a0-b0) + t((a1-a0)-(b1-b0))| — a closed-form
+ * quadratic, so it stays deterministic.
+ */
+function closestApproachT(aFrom: Vec2, aTo: Vec2, bFrom: Vec2, bTo: Vec2): number {
+  const d0 = sub(aFrom, bFrom)
+  const dv = sub(sub(aTo, aFrom), sub(bTo, bFrom))
+  const dvLenSq = dot(dv, dv)
+  if (dvLenSq === 0) return 1
+  return Math.max(0, Math.min(1, -dot(d0, dv) / dvLenSq))
+}
+
+function lerp(a: Vec2, b: Vec2, t: number): Vec2 {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
 }

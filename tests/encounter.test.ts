@@ -74,10 +74,10 @@ describe('helm', () => {
       [{ ...idle('player'), helm: { turn: 0, throttle: 4 } }, idle('bop')],
       createRng(1),
     )
-    // cruiser maxSpeed 10, engine power 2 → factor 1.0 → 10 units along +X
-    expect(state.ships[0]!.pos).toEqual({ x: 10, y: 0 })
+    // cruiser maxSpeed 8, engine power 2 → factor 1.0 → 8 units along +X
+    expect(state.ships[0]!.pos).toEqual({ x: 8, y: 0 })
     const helm = ofType(events, 'helm').find((e) => e.shipId === 'player')!
-    expect(helm.to).toEqual({ x: 10, y: 0 })
+    expect(helm.to).toEqual({ x: 8, y: 0 })
   })
 
   it('clamps turn rate to class agility', () => {
@@ -102,7 +102,7 @@ describe('helm', () => {
       idle('bop'),
     ]
     const { state } = resolveRound(s, orders, createRng(1))
-    expect(state.ships[0]!.pos.x).toBe(15) // 10 * 1.5
+    expect(state.ships[0]!.pos.x).toBe(12) // 8 * 1.5
   })
 
   it('destroyed engines: no turn, no movement', () => {
@@ -306,7 +306,8 @@ describe('torpedoes', () => {
       ],
       createRng(1),
     )
-    // BoP at engines 4 → 13 * 1.5 = 19.5/round vs torpedo 18: it outruns the fish.
+    // BoP at engines 4 → 11 * 1.5 = 16.5/round vs torpedo 18 with a 20-unit head
+    // start and 4 rounds of fuel: the fish falls short and fizzles.
     let expired = false
     for (let i = 0; i < 6 && !expired; i++) {
       cur = resolveRound(
