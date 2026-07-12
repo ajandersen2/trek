@@ -1,0 +1,367 @@
+// Encounter screen: power management on the left, station order cards on the
+// right, EXECUTE ROUND docked below them. All widgets render from the UI-owned
+// OrderDraft, so re-renders never lose in-progress orders.
+
+import { REPAIR_HP_PER_ROUND, WARP_OUT_MIN_RANGE } from '../../sim/constants'
+import type { GameState } from '../../sim/game'
+import { distance } from '../../sim/geometry'
+import { POWER_MAX_PER_SYSTEM, powerBudget, totalAllocated } from '../../sim/power'
+import type { EncounterState, EncounterStatus, ShipState, SubsystemId } from '../../sim/types'
+import { SUBSYSTEM_IDS } from '../../sim/types'
+import type { ViewState } from '../api'
+import type { ScreenContent, ShellCtx } from '../context'
+import { buildOrders, type OrderDraft } from '../draft'
+import { btn, div, el, fmt1, hint } from '../dom'
+import { OUTCOME_TITLES, SUB_LABELS } from '../labels'
+import { enemyStatusBody, panel, shipStatusBody, textRow } from '../panels'
+
+const POWER_ORDER: readonly SubsystemId[] = ['engines', 'shields', 'weapons', 'sensors']
+
+const TURN_OPTIONS = [
+  { value: -2, glyph: '◄◄', title: 'HARD PORT' },
+  { value: -1, glyph: '◄', title: 'PORT' },
+  { value: 0, glyph: '●', title: 'STEADY' },
+  { value: 1, glyph: '►', title: 'STARBOARD' },
+  { value: 2, glyph: '►►', title: 'HARD STARBOARD' },
+] as const
+
+const THROTTLE_OPTIONS = [
+  { value: 0, label: 'STOP', title: 'ALL STOP' },
+  { value: 1, label: '1/4', title: 'ONE QUARTER IMPULSE' },
+  { value: 2, label: '1/2', title: 'HALF IMPULSE' },
+  { value: 3, label: '3/4', title: 'THREE QUARTERS IMPULSE' },
+  { value: 4, label: 'FLANK', title: 'FLANK SPEED' },
+] as const
+
+export function encounterScreen(
+  view: ViewState,
+  game: GameState,
+  draft: OrderDraft,
+  ctx: ShellCtx,
+): ScreenContent {
+  const enc = game.encounter
+  if (!enc) return { left: [], right: [], overlay: null }
+  const player = enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship
+  const enemy = enc.ships.find((s) => s.id !== enc.playerShipId) ?? null
+  const locked = view.busy || enc.status !== 'active'
+  const range = enemy && enemy.alive && !enemy.warpedOut ? distance(player.pos, enemy.pos) : null
+
+  const left = [
+    powerPanel(player, draft, locked, ctx),
+    panel(player.name.toUpperCase(), 'slate', shipStatusBody(player)),
+    panel('TARGET', 'red', enemy ? enemyStatusBody(enemy, range) : [hint('NO CONTACT')]),
+  ]
+
+  const scroll = div('rail-scroll')
+  scroll.append(
+    helmPanel(player, draft, locked, range, ctx),
+    tacticalPanel(player, enemy, draft, locked, ctx),
+    sciencePanel(enemy, draft, locked, ctx),
+    commsPanel(enemy, draft, locked, ctx),
+    engineeringPanel(player, draft, locked, ctx),
+  )
+  const right = [scroll, executeDock(view, game, enc, player, draft, ctx)]
+
+  const overlay = enc.status !== 'active' ? outcomeOverlay(enc.status, enemy, view.busy, ctx) : null
+  return { left, right, overlay, overlayMode: 'dim' }
+}
+
+// --- left rail --------------------------------------------------------------
+
+function powerPanel(player: ShipState, draft: OrderDraft, locked: boolean, ctx: ShellCtx): HTMLElement {
+  const budget = powerBudget(player)
+  const total = totalAllocated(draft.power)
+  const over = total > budget
+  const body: HTMLElement[] = [textRow('CORE OUTPUT', String(budget))]
+  for (const sys of POWER_ORDER) body.push(powerRow(sys, draft, locked, ctx))
+  const totalRow = div(over ? 'power-total over' : 'power-total')
+  totalRow.append(el('span', '', 'ALLOCATED'), el('span', 'num', `${total} / ${budget}`))
+  body.push(totalRow)
+  if (over) body.push(hint('OVER BUDGET — SHED POWER TO EXECUTE', true))
+  return panel('WARP CORE', 'gold', body)
+}
+
+function powerRow(sys: SubsystemId, draft: OrderDraft, locked: boolean, ctx: ShellCtx): HTMLElement {
+  const value = draft.power[sys]
+  const row = div('power-row')
+  const minus = btn(
+    '−',
+    () => {
+      draft.power[sys] = Math.max(0, draft.power[sys] - 1)
+      ctx.rerender()
+    },
+    { classes: 'pm', disabled: locked || value <= 0, title: `REDUCE ${SUB_LABELS[sys]} POWER` },
+  )
+  const plus = btn(
+    '+',
+    () => {
+      draft.power[sys] = Math.min(POWER_MAX_PER_SYSTEM, draft.power[sys] + 1)
+      ctx.rerender()
+    },
+    { classes: 'pm', disabled: locked || value >= POWER_MAX_PER_SYSTEM, title: `BOOST ${SUB_LABELS[sys]} POWER` },
+  )
+  const segs = div('segs')
+  for (let i = 0; i < POWER_MAX_PER_SYSTEM; i++) segs.append(el('i', i < value ? 'seg on' : 'seg'))
+  row.append(el('span', 'lbl', SUB_LABELS[sys]), minus, segs, plus)
+  return row
+}
+
+// --- station cards ------------------------------------------------------------
+
+function helmPanel(
+  player: ShipState,
+  draft: OrderDraft,
+  locked: boolean,
+  range: number | null,
+  ctx: ShellCtx,
+): HTMLElement {
+  const body: HTMLElement[] = [div('group-lbl', 'TURN')]
+  const turnRow = div('opts')
+  for (const t of TURN_OPTIONS) {
+    turnRow.append(
+      btn(
+        t.glyph,
+        () => {
+          draft.turn = t.value
+          ctx.rerender()
+        },
+        { classes: 'sm', disabled: locked, pressed: draft.turn === t.value, title: t.title },
+      ),
+    )
+  }
+  body.push(turnRow, div('group-lbl', 'IMPULSE'))
+  const throttleRow = div('opts')
+  for (const t of THROTTLE_OPTIONS) {
+    throttleRow.append(
+      btn(
+        t.label,
+        () => {
+          draft.throttle = t.value
+          ctx.rerender()
+        },
+        { classes: 'sm', disabled: locked, pressed: draft.throttle === t.value, title: t.title },
+      ),
+    )
+  }
+  body.push(throttleRow)
+  body.push(
+    btn(
+      'WARP OUT',
+      () => {
+        draft.warpOut = !draft.warpOut
+        ctx.rerender()
+      },
+      { classes: 'wide', disabled: locked, pressed: draft.warpOut },
+    ),
+  )
+  const enginesUp = player.subsystems.engines.hp > 0
+  const rangeNote = range !== null ? ` · RANGE ${fmt1(range)}` : ''
+  body.push(
+    hint(
+      `DISENGAGE: NEEDS RANGE ≥ ${WARP_OUT_MIN_RANGE} AND ENGINES ONLINE${rangeNote}`,
+      draft.warpOut && !enginesUp,
+    ),
+  )
+  return panel('HELM', 'gold', body)
+}
+
+function tacticalPanel(
+  player: ShipState,
+  enemy: ShipState | null,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): HTMLElement {
+  const scanned = !!enemy && enemy.scanLevel >= 1
+  const body: HTMLElement[] = [
+    btn(
+      'FIRE PHASERS',
+      () => {
+        draft.firePhasers = !draft.firePhasers
+        ctx.rerender()
+      },
+      { classes: 'wide fire', disabled: locked || !enemy, pressed: draft.firePhasers },
+    ),
+    div('group-lbl', 'TARGETING'),
+  ]
+  const targetRow = div('opts')
+  targetRow.append(
+    btn(
+      'HULL',
+      () => {
+        draft.targetSubsystem = null
+        ctx.rerender()
+      },
+      { classes: 'sm', disabled: locked, pressed: draft.targetSubsystem === null },
+    ),
+  )
+  for (const sys of SUBSYSTEM_IDS) {
+    targetRow.append(
+      btn(
+        SUB_LABELS[sys],
+        () => {
+          draft.targetSubsystem = sys
+          ctx.rerender()
+        },
+        { classes: 'sm', disabled: locked || !scanned, pressed: draft.targetSubsystem === sys },
+      ),
+    )
+  }
+  body.push(targetRow)
+  if (!scanned) body.push(hint('SCAN REQUIRED FOR SUBSYSTEM TARGETING'))
+  body.push(
+    btn(
+      `FIRE TORPEDO · ${player.torpedoes}`,
+      () => {
+        draft.fireTorpedo = !draft.fireTorpedo
+        ctx.rerender()
+      },
+      {
+        classes: 'wide fire',
+        disabled: locked || !enemy || player.torpedoes < 1,
+        pressed: draft.fireTorpedo,
+        title: player.torpedoes < 1 ? 'TORPEDO MAGAZINE EMPTY' : 'NARROW FORWARD LAUNCH WINDOW',
+      },
+    ),
+  )
+  return panel('TACTICAL', 'accent', body)
+}
+
+function sciencePanel(
+  enemy: ShipState | null,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): HTMLElement {
+  const scanned = !!enemy && enemy.scanLevel >= 1
+  return panel('SCIENCE', 'slate', [
+    btn(
+      'SCAN TARGET',
+      () => {
+        draft.scan = !draft.scan
+        ctx.rerender()
+      },
+      { classes: 'wide', disabled: locked || !enemy || scanned, pressed: draft.scan },
+    ),
+    hint(scanned ? 'TARGET SCANNED — FULL TELEMETRY ON TACTICAL' : 'REVEALS SHIELDS + SUBSYSTEMS · ENABLES TARGETING'),
+  ])
+}
+
+function commsPanel(
+  enemy: ShipState | null,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): HTMLElement {
+  return panel('COMMS', 'lavender', [
+    btn(
+      'HAIL',
+      () => {
+        draft.hail = !draft.hail
+        ctx.rerender()
+      },
+      { classes: 'wide', disabled: locked || !enemy, pressed: draft.hail },
+    ),
+    hint('OPEN A CHANNEL TO THE HOSTILE VESSEL'),
+  ])
+}
+
+function engineeringPanel(
+  player: ShipState,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): HTMLElement {
+  const row = div('opts')
+  row.append(
+    btn(
+      'NONE',
+      () => {
+        draft.repair = null
+        ctx.rerender()
+      },
+      { classes: 'sm', disabled: locked, pressed: draft.repair === null },
+    ),
+  )
+  for (const sys of SUBSYSTEM_IDS) {
+    const sub = player.subsystems[sys]
+    row.append(
+      btn(
+        SUB_LABELS[sys],
+        () => {
+          draft.repair = sys
+          ctx.rerender()
+        },
+        { classes: 'sm', disabled: locked || sub.hp >= sub.maxHp, pressed: draft.repair === sys },
+      ),
+    )
+  }
+  return panel('ENGINEERING', 'peach', [
+    div('group-lbl', 'FIELD REPAIR'),
+    row,
+    hint(`REPAIR CREWS RESTORE +${REPAIR_HP_PER_ROUND} HP TO ONE SUBSYSTEM PER ROUND`),
+  ])
+}
+
+function executeDock(
+  view: ViewState,
+  game: GameState,
+  enc: EncounterState,
+  player: ShipState,
+  draft: OrderDraft,
+  ctx: ShellCtx,
+): HTMLElement {
+  const over = totalAllocated(draft.power) > powerBudget(player)
+  const dock = div('execute-dock')
+  dock.append(
+    btn(
+      view.busy ? 'RESOLVING…' : `EXECUTE ROUND ${enc.round}`,
+      () => ctx.callbacks.onExecuteRound(buildOrders(draft, game)),
+      {
+        classes: 'primary execute wide',
+        disabled: view.busy || over || enc.status !== 'active',
+      },
+    ),
+  )
+  if (over && !view.busy) dock.append(hint('POWER OVER BUDGET — EXECUTE LOCKED', true))
+  return dock
+}
+
+// --- end-of-battle overlay ------------------------------------------------------
+
+function outcomeOverlay(
+  status: EncounterStatus,
+  enemy: ShipState | null,
+  busy: boolean,
+  ctx: ShellCtx,
+): HTMLElement {
+  const defeat = status === 'defeat'
+  const box = div(defeat ? 'outcome-box defeat' : 'outcome-box')
+  box.append(
+    div(defeat ? 'outcome-title blink' : 'outcome-title', OUTCOME_TITLES[status]),
+    div('outcome-sub', outcomeSubtitle(status, enemy)),
+    btn(defeat ? 'ACKNOWLEDGE' : 'RETURN TO SECTOR', () => ctx.callbacks.onConcludeEncounter(), {
+      classes: defeat ? 'danger' : 'primary',
+      disabled: busy,
+    }),
+  )
+  return box
+}
+
+function outcomeSubtitle(status: EncounterStatus, enemy: ShipState | null): string {
+  const name = (enemy?.name ?? 'THE ENEMY').toUpperCase()
+  switch (status) {
+    case 'victory':
+      return `${name} IS DESTROYED`
+    case 'enemy-disabled':
+      return `${name} IS DEAD IN SPACE`
+    case 'enemy-withdrawn':
+      return `${name} HAS FLED THE SYSTEM`
+    case 'withdrawn':
+      return 'WE HAVE DISENGAGED'
+    case 'defeat':
+      return 'THE SHIP IS BREAKING UP'
+    default:
+      return ''
+  }
+}
