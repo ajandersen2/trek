@@ -173,6 +173,73 @@ try {
   const mutedAfter = await page.evaluate(() => window.__sc.view().muted)
   if (mutedBefore === mutedAfter) throw new Error('mute toggle had no effect')
 
+  // --- Hot-seat skirmish (M2.5): fed cruiser vs cloaked Bird-of-Prey
+  await page.evaluate(() => {
+    window.__sc.callbacks.onOpenSkirmishSetup()
+    window.__sc.callbacks.onStartSkirmish({ seed: 7, shipClassA: 'fed-cruiser', shipClassB: 'klingon-bop' })
+  })
+  const skirmishStart = await page.evaluate(() => window.__sc.view().screen)
+  if (skirmishStart !== 'skirmish') throw new Error(`skirmish did not start (${skirmishStart})`)
+  await shot('7-skirmish')
+
+  const seatOrders = (seat) =>
+    page.evaluate((seatId) => {
+      const v = window.__sc.view()
+      const sk = v.skirmish
+      const myId = sk.shipIds[seatId]
+      const me = sk.encounter.ships.find((s) => s.id === myId)
+      const foe = sk.encounter.ships.find((s) => s.id !== myId)
+      const hasCloak = me.classId === 'klingon-bop'
+      window.__sc.callbacks.onSkirmishOrders({
+        shipId: myId,
+        // Captain B (BoP) cloaks on round 2+ to exercise POV hiding; A sweeps.
+        helm: { turn: 1, throttle: 2, ...(hasCloak && sk.round >= 2 ? { cloak: true } : {}) },
+        tactical: foe.cloaked || (hasCloak && sk.round >= 2)
+          ? {}
+          : { firePhasers: { targetId: foe.id, subsystem: null } },
+        science: { scanTargetId: foe.id },
+        engineering: {
+          power: foe.cloaked
+            ? { engines: 1, shields: 3, weapons: 0, sensors: 4 }
+            : { engines: 2, shields: 2, weapons: 4, sensors: 2 },
+          repair: null,
+        },
+      })
+    }, seat)
+
+  for (let round = 0; round < 3; round++) {
+    // Seat A orders (screen: skirmish, seat A)
+    await seatOrders('A')
+    let scr = await page.evaluate(() => window.__sc.view().screen)
+    if (scr !== 'handoff') throw new Error(`expected handoff after A's orders, got ${scr}`)
+    if (round === 0) await shot('8-handoff')
+    await page.evaluate(() => window.__sc.callbacks.onHandoffReady())
+    // Seat B orders → resolve + replay
+    await seatOrders('B')
+    await page.waitForFunction(() => !window.__sc.isBusy(), undefined, { timeout: 30000 })
+    const st = await page.evaluate(() => ({
+      screen: window.__sc.view().screen,
+      status: window.__sc.view().skirmish?.encounter.status,
+      round: window.__sc.view().skirmish?.encounter.round,
+    }))
+    if (st.status !== 'active') break // early finish is legal
+    if (st.screen !== 'handoff') throw new Error(`expected handoff after replay, got ${st.screen}`)
+    await page.evaluate(() => window.__sc.callbacks.onHandoffReady())
+  }
+  // The BoP cloaked from round 2: the public replay must have hidden it — no
+  // direct pixel assert here, but the POV path is exercised; console errors fail us.
+  const skirmishState = await page.evaluate(() => {
+    const v = window.__sc.view()
+    return { round: v.skirmish?.encounter.round, cloakedB: v.skirmish?.encounter.ships[1]?.cloaked }
+  })
+  if (!skirmishState.round || skirmishState.round < 3) {
+    throw new Error(`skirmish rounds did not advance (round=${skirmishState.round})`)
+  }
+  await shot('9-skirmish-late')
+  await page.evaluate(() => window.__sc.callbacks.onLeaveSkirmish())
+  const backAt = await page.evaluate(() => window.__sc.view().screen)
+  if (backAt !== 'menu') throw new Error(`leave skirmish should return to menu, got ${backAt}`)
+
   if (problems.length) {
     fail('console/page errors during run')
   } else {

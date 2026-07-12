@@ -30,6 +30,14 @@ export interface GameRender {
   animateRound(events: RoundEvent[], finalState: EncounterState): Promise<void>
   /** Blank the viewport (menu / game-over screens own the center). */
   hide(): void
+  /**
+   * Point of view for information hiding (hot-seat): the ship whose captain is
+   * looking at the board. The POV ship renders as a translucent ghost when
+   * cloaked; all other cloaked ships are hidden entirely. null = public view
+   * (no ghosts at all — used while both captains watch a replay together).
+   * Until first called, defaults to the encounter's playerShipId (campaign).
+   */
+  setPov(shipId: string | null): void
 }
 
 export type CreateRender = (

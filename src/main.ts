@@ -17,10 +17,14 @@ import {
   travelTo,
   type GameState,
 } from './sim/game'
+import { createEncounter, resolveRound } from './sim/encounter'
 import { createRng, type Rng } from './sim/rng'
 import { SaveError, deserializeGame, serializeGame } from './sim/save'
-import type { OrderSet } from './sim/types'
-import type { SaveSlotInfo, Screen, UICallbacks, ViewState } from './ui/api'
+import { createShip } from './sim/ship'
+import type { EncounterState, OrderSet } from './sim/types'
+import { SKIRMISH_SHIPS } from './data/skirmish'
+import { createHotseatTransport, type HotseatTransport } from './net/hotseat'
+import type { SaveSlotInfo, Screen, SeatId, UICallbacks, ViewState } from './ui/api'
 import { createShell } from './ui/shell'
 
 const AUTOSAVE_SLOT = 0
@@ -52,6 +56,20 @@ let transport: Transport | null = null
 let aiRng: Rng = createRng(0)
 let render: GameRender
 
+// --- hot-seat skirmish state (M2.5); campaign state above is untouched by it.
+interface SkirmishSession {
+  encounter: EncounterState
+  rng: Rng
+  shipIds: Record<SeatId, string>
+  names: Record<SeatId, string>
+  activeSeat: SeatId
+  phase: 'orders' | 'handoff' | 'resolving'
+  ordersA: OrderSet | null
+  transport: HotseatTransport
+}
+let skirmish: SkirmishSession | null = null
+let skirmishSetupOpen = false
+
 // --- audio -------------------------------------------------------------------
 const MUTE_KEY = 'starship-command-muted'
 const audio = createAudio()
@@ -81,6 +99,8 @@ const VALID_CUES: ReadonlySet<string> = new Set<SoundCue>([
 ])
 
 function screen(): Screen {
+  if (skirmish) return skirmish.phase === 'handoff' ? 'handoff' : 'skirmish'
+  if (skirmishSetupOpen) return 'skirmish-setup'
   if (atMenu || !game) return 'menu'
   if (game.mode === 'game-over') return 'game-over'
   return game.mode === 'encounter' ? 'encounter' : 'sector'
@@ -108,22 +128,46 @@ function slotLabel(slot: number): string | null {
 }
 
 function view(): ViewState {
-  return { screen: screen(), game, saveSlots: saveSlots(), selectedSystemId, busy, muted: audio.isMuted() }
+  return {
+    screen: screen(),
+    game,
+    saveSlots: saveSlots(),
+    selectedSystemId,
+    busy,
+    muted: audio.isMuted(),
+    skirmish: skirmish
+      ? {
+          encounter: skirmish.encounter,
+          shipIds: { ...skirmish.shipIds },
+          names: { ...skirmish.names },
+          activeSeat: skirmish.activeSeat,
+          round: skirmish.encounter.round,
+        }
+      : null,
+  }
 }
 
 /** Push current state to UI + render + audio loops. Render is left alone mid-animation. */
 function refresh(): void {
   shell.render(view())
   const s = screen()
-  audio.setAmbient(s === 'sector' || s === 'encounter')
-  audio.setRedAlert(s === 'encounter' && game?.encounter?.status === 'active')
+  audio.setAmbient(s === 'sector' || s === 'encounter' || s === 'skirmish')
+  audio.setRedAlert(
+    (s === 'encounter' && game?.encounter?.status === 'active') ||
+      (s === 'skirmish' && skirmish?.encounter.status === 'active'),
+  )
   if (busy) return
   if (s === 'sector' && game) {
     render.showSector(game)
     render.setSelectedSystem(selectedSystemId)
   } else if (s === 'encounter' && game?.encounter) {
     render.showEncounter(game.encounter)
+  } else if (s === 'skirmish' && skirmish) {
+    // POV of whoever holds the console; public view while resolving.
+    render.setPov(skirmish.phase === 'orders' ? skirmish.shipIds[skirmish.activeSeat] : null)
+    render.showEncounter(skirmish.encounter)
   } else {
+    // Menu, game-over, handoff: nothing on the viewport that could leak intel.
     render.hide()
   }
 }
@@ -278,6 +322,103 @@ const callbacks: UICallbacks = {
   onUiBeep(kind) {
     audio.uiBeep(kind)
   },
+
+  // --- hot-seat skirmish (M2.5) -----------------------------------------------
+
+  onOpenSkirmishSetup() {
+    if (skirmish || busy) return
+    skirmishSetupOpen = true
+    refresh()
+  },
+
+  onStartSkirmish(config) {
+    if (skirmish || busy) return
+    const optionA = SKIRMISH_SHIPS.find((o) => o.classId === config.shipClassA)
+    const optionB = SKIRMISH_SHIPS.find((o) => o.classId === config.shipClassB)
+    if (!optionA || !optionB) return
+    const nameA = optionA.names[0]
+    // Mirror matches get each side's alternate name so the log reads cleanly.
+    const nameB = optionA.classId === optionB.classId ? optionB.names[1] : optionB.names[0]
+    const rng = createRng(config.seed >>> 0)
+    const shipA = createShip('ship-a', nameA, optionA.classId, { x: 0, y: 0 }, 0)
+    const shipB = createShip('ship-b', nameB, optionB.classId, { x: 0, y: 0 }, 8)
+    const encounter = createEncounter(shipA, shipB, rng)
+    const hotseat = createHotseatTransport()
+    skirmish = {
+      encounter,
+      rng,
+      shipIds: { A: 'ship-a', B: 'ship-b' },
+      names: { A: nameA, B: nameB },
+      activeSeat: 'A',
+      phase: 'orders',
+      ordersA: null,
+      transport: hotseat,
+    }
+    skirmishSetupOpen = false
+    hotseat.onOrders(resolveSkirmishRound)
+    refresh()
+    shell.appendLog([
+      `SKIRMISH — ${nameA} versus ${nameB}. Captain A has the console.`,
+      'Orders are secret: hand off the console when prompted.',
+    ])
+  },
+
+  onSkirmishOrders(orders) {
+    if (!skirmish || busy || skirmish.phase !== 'orders') return
+    if (skirmish.encounter.status !== 'active') return
+    if (skirmish.activeSeat === 'A') {
+      skirmish.ordersA = orders
+      skirmish.activeSeat = 'B'
+      skirmish.phase = 'handoff'
+      refresh()
+    } else {
+      skirmish.phase = 'resolving'
+      refresh()
+      skirmish.transport.submitOpponentOrders(orders)
+    }
+  },
+
+  onHandoffReady() {
+    if (!skirmish || busy || skirmish.phase !== 'handoff') return
+    skirmish.phase = 'orders'
+    refresh()
+  },
+
+  onLeaveSkirmish() {
+    if (!skirmish) return
+    skirmish.transport.close()
+    skirmish = null
+    skirmishSetupOpen = false
+    atMenu = true
+    render.setPov(null)
+    refresh()
+  },
+}
+
+function resolveSkirmishRound(ordersB: OrderSet): void {
+  const s = skirmish
+  if (!s || !s.ordersA) return
+  const ordersA = s.ordersA
+  s.ordersA = null
+  busy = true
+  const { state: encounter, events } = resolveRound(s.encounter, [ordersA, ordersB], s.rng)
+  s.encounter = encounter
+  const lines = shell.eventsToLog(events, view())
+  render.setPov(null) // both captains watch the replay: public view
+  void render.animateRound(events, encounter).then(() => {
+    busy = false
+    if (!skirmish) return // duel abandoned mid-animation
+    if (encounter.status === 'active') {
+      // Next round: captain A takes the console again behind a handoff screen.
+      skirmish.activeSeat = 'A'
+      skirmish.phase = 'handoff'
+    } else {
+      skirmish.phase = 'resolving' // outcome overlay owns the screen now
+      audio.stingers.victory()
+    }
+    refresh()
+    shell.appendLog(lines)
+  })
 }
 
 const shell = createShell(document.getElementById('app')!, callbacks)

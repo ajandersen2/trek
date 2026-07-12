@@ -4,9 +4,29 @@
 // state and never imports Phaser or src/render.
 
 import type { GameState } from '../sim/game'
-import type { OrderSet, RoundEvent } from '../sim/types'
+import type { EncounterState, OrderSet, RoundEvent } from '../sim/types'
 
-export type Screen = 'menu' | 'sector' | 'encounter' | 'game-over'
+export type Screen =
+  | 'menu'
+  | 'sector'
+  | 'encounter'
+  | 'game-over'
+  | 'skirmish-setup'
+  | 'skirmish' // order-taking for the active seat
+  | 'handoff' // board hidden; pass the console to the other captain
+
+export type SeatId = 'A' | 'B'
+
+/** Hot-seat 1v1 duel (M2.5). Campaign state is untouched while this is set. */
+export interface SkirmishView {
+  encounter: EncounterState
+  /** Ship ids per seat: seat A is encounter.ships[0], B is ships[1]. */
+  shipIds: Record<SeatId, string>
+  names: Record<SeatId, string>
+  /** Whose orders are being taken (skirmish screen) or who is next (handoff). */
+  activeSeat: SeatId
+  round: number
+}
 
 export interface SaveSlotInfo {
   slot: number
@@ -25,6 +45,14 @@ export interface ViewState {
   busy: boolean
   /** Audio mute state (header toggle reflects it). */
   muted: boolean
+  /** Non-null while a hot-seat duel is running (screens skirmish-setup/skirmish/handoff). */
+  skirmish: SkirmishView | null
+}
+
+export interface SkirmishConfig {
+  seed: number
+  shipClassA: string
+  shipClassB: string
 }
 
 /** UI feedback sounds; routed to the audio engine by the controller. */
@@ -49,6 +77,18 @@ export interface UICallbacks {
   onToggleMute(): void
   /** Fire-and-forget UI sound feedback; call on every button interaction. */
   onUiBeep(kind: UiBeepKind): void
+
+  // --- hot-seat skirmish (M2.5) ---
+  /** Open the skirmish setup screen (from the menu). */
+  onOpenSkirmishSetup(): void
+  /** Begin a duel with the chosen ships. */
+  onStartSkirmish(config: SkirmishConfig): void
+  /** The active seat committed its hidden orders. */
+  onSkirmishOrders(orders: OrderSet): void
+  /** The handoff screen's READY button: the next captain has the console. */
+  onHandoffReady(): void
+  /** Leave the duel (outcome screen or mid-match retreat to menu). */
+  onLeaveSkirmish(): void
 }
 
 export interface Shell {
