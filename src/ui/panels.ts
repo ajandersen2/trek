@@ -78,7 +78,13 @@ export function enemyStatusBody(enemy: ShipState, range: number | null): HTMLEle
   head.append(el('span', 'target-name', enemy.name.toUpperCase()))
   if (!enemy.alive) head.append(el('span', 'chip chip-destroyed', 'DESTROYED'))
   else if (enemy.warpedOut) head.append(el('span', 'chip chip-empty', 'WARPED OUT'))
+  else if (enemy.cloaked) head.append(el('span', 'chip chip-cloaked', 'CLOAKED'))
   out.push(head)
+  if (enemy.cloaked && enemy.alive && !enemy.warpedOut) {
+    // No telemetry through a cloak — not even the hull bar.
+    out.push(div('cloak-note', 'CLOAKED — LAST KNOWN BEARING UNKNOWN'))
+    return out
+  }
   if (range !== null && enemy.alive && !enemy.warpedOut) {
     out.push(textRow('RANGE', range.toFixed(1)))
   }

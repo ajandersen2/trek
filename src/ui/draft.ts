@@ -2,6 +2,7 @@
 // complete OrderSet when EXECUTE ROUND is pressed. Draft objects belong to the
 // UI — they are never sim state and never mutate anything from GameState.
 
+import { getShipClass } from '../data/ships'
 import { THROTTLE_MAX } from '../sim/constants'
 import type { GameState } from '../sim/game'
 import { clampAllocation, powerBudget } from '../sim/power'
@@ -12,6 +13,8 @@ export interface OrderDraft {
   turn: number
   throttle: number
   warpOut: boolean
+  /** Desired cloak state (absolute). Only sent when the ship class hasCloak. */
+  cloak: boolean
   firePhasers: boolean
   /** null targets the hull. */
   targetSubsystem: SubsystemId | null
@@ -24,7 +27,8 @@ export interface OrderDraft {
 /**
  * Fresh draft for a new round: power mirrors the ship's current allocation
  * (clamped to the live budget), one-shot toggles and turn reset, throttle
- * carries over from the previous round of the same encounter.
+ * carries over from the previous round of the same encounter. The cloak
+ * toggle starts at the ship's current state (HelmOrder.cloak is absolute).
  */
 export function newDraft(ship: ShipState, throttle: number): OrderDraft {
   return {
@@ -32,6 +36,7 @@ export function newDraft(ship: ShipState, throttle: number): OrderDraft {
     turn: 0,
     throttle: Math.max(0, Math.min(THROTTLE_MAX, Math.trunc(throttle))),
     warpOut: false,
+    cloak: ship.cloaked,
     firePhasers: false,
     targetSubsystem: null,
     fireTorpedo: false,
@@ -51,6 +56,9 @@ export function buildOrders(draft: OrderDraft, game: GameState): OrderSet {
     tactical: {},
     engineering: { power: { ...draft.power }, repair: draft.repair },
   }
+  // Ships without a cloaking device never send the order (the sim would ignore
+  // it, but the wire format stays clean for lockstep hashing).
+  if (getShipClass(game.ship.classId).hasCloak) orders.helm.cloak = draft.cloak
   if (enemy) {
     if (draft.firePhasers) {
       orders.tactical.firePhasers = { targetId: enemy.id, subsystem: draft.targetSubsystem }

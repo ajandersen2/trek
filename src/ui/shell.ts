@@ -5,12 +5,16 @@
 
 import './lcars.css'
 
+import { getMissionDef } from '../data/missions'
 import { getSystem } from '../data/sectors'
+import type { MissionRecord } from '../sim/game'
+import { powerBudget, totalAllocated } from '../sim/power'
 import type { CreateShell, ViewState } from './api'
 import type { ScreenContent, ShellCtx, UiState } from './context'
-import { newDraft } from './draft'
-import { el } from './dom'
+import { buildOrders, newDraft } from './draft'
+import { btn, el, setBeeper } from './dom'
 import { eventsToLog, lineClass } from './log'
+import { helpOverlay, logOverlay } from './overlays'
 import { encounterScreen } from './screens/encounter'
 import { gameOverScreen } from './screens/gameover'
 import { menuScreen } from './screens/menu'
@@ -52,6 +56,7 @@ const SKELETON = `
       <span class="val" data-lcars="mission">STANDBY</span>
     </div>
     <div class="hdr-alert">RED ALERT</div>
+    <div class="hdr-ctl" data-lcars="ctl"></div>
     <i class="hdr-tail"></i>
     <i class="hdr-cap"></i>
   </header>
@@ -67,6 +72,7 @@ const SKELETON = `
     </div>
     <div class="ftr-bar"><i class="ftr-seg"></i><i class="ftr-tail"></i><i class="ftr-cap"></i></div>
   </footer>
+  <div class="shell-modal" data-lcars="modal"></div>
 </div>
 `
 
@@ -88,8 +94,20 @@ export const createShell: CreateShell = (root, callbacks) => {
   const stardateEl = grab('stardate')
   const systemEl = grab('system')
   const missionEl = grab('mission')
+  const ctlEl = grab('ctl')
+  const modalEl = grab('modal')
 
-  const ui: UiState = { seedText: '', draft: null, encounterKey: null, roundKey: null }
+  // Every btn() press across the UI beeps through the controller from here on.
+  setBeeper((kind) => callbacks.onUiBeep(kind))
+
+  const ui: UiState = {
+    seedText: '',
+    permadeath: true,
+    draft: null,
+    encounterKey: null,
+    roundKey: null,
+    overlay: null,
+  }
   let lastView: ViewState | null = null
 
   const ctx: ShellCtx = {
@@ -98,6 +116,32 @@ export const createShell: CreateShell = (root, callbacks) => {
     rerender: () => {
       if (lastView) render(lastView)
     },
+  }
+
+  // --- header chrome: mute / log archive / help pills -----------------------
+  const muteBtn = btn('', () => callbacks.onToggleMute(), {
+    classes: 'hdr-pill',
+    title: 'TOGGLE AUDIO (M)',
+  })
+  const logBtn = btn('LOG', () => toggleOverlay('log'), {
+    classes: 'hdr-pill',
+    title: "CAPTAIN'S LOG ARCHIVE",
+  })
+  const helpBtn = btn('?', () => toggleOverlay('help'), {
+    classes: 'hdr-pill',
+    title: 'HOW TO PLAY',
+  })
+  ctlEl.append(muteBtn, logBtn, helpBtn)
+
+  function toggleOverlay(kind: 'log' | 'help'): void {
+    ui.overlay = ui.overlay === kind ? null : kind
+    ctx.rerender()
+  }
+
+  function closeOverlay(): void {
+    if (!ui.overlay) return
+    ui.overlay = null
+    ctx.rerender()
   }
 
   function render(view: ViewState): void {
@@ -114,6 +158,24 @@ export const createShell: CreateShell = (root, callbacks) => {
     } else {
       overlayEl.replaceChildren()
       overlayEl.className = 'center-overlay'
+    }
+    renderModal(view)
+  }
+
+  /** Full-screen overlay layer (log archive / help), above everything else. */
+  function renderModal(view: ViewState): void {
+    if (ui.overlay === 'log' && !view.game) ui.overlay = null // no campaign, no archive
+    if (ui.overlay === 'log' && view.game) {
+      modalEl.replaceChildren(logOverlay(view.game.logArchive, closeOverlay))
+      modalEl.classList.add('visible')
+      const scroll = modalEl.querySelector<HTMLElement>('.modal-scroll')
+      if (scroll) scroll.scrollTop = scroll.scrollHeight // newest entries at the bottom
+    } else if (ui.overlay === 'help') {
+      modalEl.replaceChildren(helpOverlay(closeOverlay))
+      modalEl.classList.add('visible')
+    } else {
+      modalEl.replaceChildren()
+      modalEl.classList.remove('visible')
     }
   }
 
@@ -138,7 +200,9 @@ export const createShell: CreateShell = (root, callbacks) => {
     if (view.screen === 'encounter' && game?.encounter) {
       const enc = game.encounter
       const enemy = enc.ships.find((s) => s.id !== enc.playerShipId)
-      const encounterKey = `${game.seed}:${game.galaxy.stardate}:${game.encounterContext ?? ''}:${enemy?.id ?? ''}:${enemy?.name ?? ''}`
+      const context = game.encounterContext
+      const contextKey = context ? (context.kind === 'mission' ? context.defId : 'random') : ''
+      const encounterKey = `${game.seed}:${game.galaxy.stardate}:${contextKey}:${enemy?.id ?? ''}:${enemy?.name ?? ''}`
       const roundKey = `${encounterKey}#${enc.round}`
       if (ui.roundKey !== roundKey) {
         const carried = ui.encounterKey === encounterKey && ui.draft ? ui.draft.throttle : 0
@@ -159,13 +223,27 @@ export const createShell: CreateShell = (root, callbacks) => {
     if (game) {
       stardateEl.textContent = game.galaxy.stardate.toFixed(1)
       systemEl.textContent = getSystem(game.galaxy.currentSystemId).name.toUpperCase()
-      const status = game.mission.stage === 'resolved' ? 'COMPLETE' : 'IN PROGRESS'
-      missionEl.textContent = `${game.mission.title} — ${status}`.toUpperCase()
+      missionEl.textContent = missionHeadline(game.missions)
     } else {
       stardateEl.textContent = '—'
       systemEl.textContent = '—'
       missionEl.textContent = 'STANDBY'
     }
+    muteBtn.textContent = view.muted ? '◄ ✕ MUTED' : '◄)) SOUND ON'
+    muteBtn.setAttribute('aria-pressed', String(view.muted))
+    muteBtn.classList.toggle('on', view.muted)
+    logBtn.disabled = !game
+  }
+
+  function missionHeadline(missions: MissionRecord[]): string {
+    const active = missions.filter((m) => m.stage === 'active')
+    if (active.length > 0) {
+      const title = getMissionDef(active[0]!.defId).title
+      const more = active.length > 1 ? ` +${active.length - 1}` : ''
+      return `${title}${more} — IN PROGRESS`.toUpperCase()
+    }
+    if (missions.some((m) => m.stage === 'resolved')) return 'ALL MISSIONS COMPLETE'
+    return 'STANDBY'
   }
 
   function isRedAlert(view: ViewState): boolean {
@@ -181,6 +259,47 @@ export const createShell: CreateShell = (root, callbacks) => {
     }
     while (logEl.childElementCount > MAX_LOG_LINES) logEl.firstElementChild?.remove()
     logEl.scrollTop = logEl.scrollHeight
+  }
+
+  // --- keyboard shortcuts: SPACE/Enter execute, M mute, ESC closes overlays --
+  window.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return
+    if (e.key === 'Escape') {
+      if (ui.overlay) {
+        callbacks.onUiBeep('tap')
+        closeOverlay()
+      }
+      return
+    }
+    // Never hijack typing (seed input) or a focused button's own activation.
+    const target = e.target
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return
+    if (e.key === 'm' || e.key === 'M') {
+      callbacks.onUiBeep('tap')
+      callbacks.onToggleMute()
+      return
+    }
+    if (e.key === ' ' || e.key === 'Enter') {
+      if (target instanceof HTMLButtonElement) return
+      if (ui.overlay || !lastView || lastView.screen !== 'encounter') return
+      e.preventDefault()
+      executeFromKeyboard(lastView)
+    }
+  })
+
+  /** Same rules and beeps as the EXECUTE ROUND button, minus the DOM. */
+  function executeFromKeyboard(view: ViewState): void {
+    const game = view.game
+    const enc = game?.encounter
+    const draft = ui.draft
+    if (!game || !enc || !draft || enc.status !== 'active') return
+    const player = enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship
+    if (view.busy || totalAllocated(draft.power) > powerBudget(player)) {
+      callbacks.onUiBeep('deny')
+      return
+    }
+    callbacks.onUiBeep('execute')
+    callbacks.onExecuteRound(buildOrders(draft, game))
   }
 
   return {

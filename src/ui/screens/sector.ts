@@ -1,6 +1,7 @@
 // Sector screen: ship status on the left, navigation / mission / saves on the
 // right. The center is the Phaser sector map (owned by the render layer).
 
+import { getMissionDef, type MissionDef } from '../../data/missions'
 import { getSystem } from '../../data/sectors'
 import type { StarSystem } from '../../sim/galaxy'
 import type { GameState } from '../../sim/game'
@@ -49,7 +50,7 @@ function navigationPanel(view: ViewState, current: StarSystem, ctx: ShellCtx): H
       () => {
         if (view.selectedSystemId) ctx.callbacks.onTravel(view.selectedSystemId)
       },
-      { classes: 'primary wide', disabled: view.busy || !canWarp },
+      { classes: 'primary wide', disabled: view.busy || !canWarp, beep: 'confirm' },
     ),
   )
   if (current.type === 'starbase') {
@@ -57,27 +58,43 @@ function navigationPanel(view: ViewState, current: StarSystem, ctx: ShellCtx): H
       btn('DOCK — REPAIR & REARM', () => ctx.callbacks.onDock(), {
         classes: 'wide',
         disabled: view.busy,
+        beep: 'confirm',
       }),
     )
   }
   return panel('NAVIGATION', 'gold', body)
 }
 
+/** All non-inactive missions: active ones with an objective line, resolved ones as COMPLETE. */
 function missionPanel(game: GameState): HTMLElement {
-  const resolved = game.mission.stage === 'resolved'
-  const body: HTMLElement[] = [div('sys-name', game.mission.title.toUpperCase())]
-  body.push(
-    resolved
-      ? div('mission-done', 'COMPLETE')
-      : div('sys-desc', 'Respond to the distress call at Veyra Colony.'),
-  )
+  const body: HTMLElement[] = []
+  for (const rec of game.missions) {
+    if (rec.stage === 'inactive') continue
+    const def = getMissionDef(rec.defId)
+    body.push(div('sys-name', def.title.toUpperCase()))
+    body.push(
+      rec.stage === 'resolved'
+        ? div('mission-done', 'COMPLETE')
+        : div('sys-desc', objectiveLine(def)),
+    )
+  }
+  if (body.length === 0) body.push(hint('NO ACTIVE ORDERS FROM STARBASE 4'))
   return panel('MISSION', 'lavender', body)
+}
+
+function objectiveLine(def: MissionDef): string {
+  if (def.trigger.type === 'at-system') {
+    return `Proceed to ${getSystem(def.trigger.systemId).name} and stop ${def.enemyName}.`
+  }
+  return `${def.enemyName} is hunting us — it will find us in open space.`
 }
 
 function savePanel(view: ViewState, ctx: ShellCtx): HTMLElement {
   const body: HTMLElement[] = []
   for (const slot of [1, 2, 3]) body.push(slotRow(slot, view, ctx))
-  body.push(btn('EXPORT SAVE FILE', () => ctx.callbacks.onExportSave(), { classes: 'wide sm' }))
+  body.push(
+    btn('EXPORT SAVE FILE', () => ctx.callbacks.onExportSave(), { classes: 'wide sm', beep: 'confirm' }),
+  )
   return panel('SAVE / LOAD', 'slate', body)
 }
 
@@ -87,8 +104,8 @@ function slotRow(slot: number, view: ViewState, ctx: ShellCtx): HTMLElement {
   row.append(
     el('span', 'slot-tag', `S${slot}`),
     el('span', label ? 'slot-name' : 'slot-name empty', label ?? 'EMPTY'),
-    btn('SAVE', () => ctx.callbacks.onSaveSlot(slot), { classes: 'sm' }),
-    btn('LOAD', () => ctx.callbacks.onLoadSlot(slot), { classes: 'sm', disabled: !label }),
+    btn('SAVE', () => ctx.callbacks.onSaveSlot(slot), { classes: 'sm', beep: 'confirm' }),
+    btn('LOAD', () => ctx.callbacks.onLoadSlot(slot), { classes: 'sm', disabled: !label, beep: 'confirm' }),
   )
   return row
 }

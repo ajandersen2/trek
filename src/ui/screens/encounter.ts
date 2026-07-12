@@ -2,6 +2,7 @@
 // right, EXECUTE ROUND docked below them. All widgets render from the UI-owned
 // OrderDraft, so re-renders never lose in-progress orders.
 
+import { getShipClass } from '../../data/ships'
 import { REPAIR_HP_PER_ROUND, WARP_OUT_MIN_RANGE } from '../../sim/constants'
 import type { GameState } from '../../sim/game'
 import { distance } from '../../sim/geometry'
@@ -11,7 +12,7 @@ import { SUBSYSTEM_IDS } from '../../sim/types'
 import type { ViewState } from '../api'
 import type { ScreenContent, ShellCtx } from '../context'
 import { buildOrders, type OrderDraft } from '../draft'
-import { btn, div, el, fmt1, hint } from '../dom'
+import { beep, btn, div, el, fmt1, hint } from '../dom'
 import { OUTCOME_TITLES, SUB_LABELS } from '../labels'
 import { enemyStatusBody, panel, shipStatusBody, textRow } from '../panels'
 
@@ -44,7 +45,11 @@ export function encounterScreen(
   const player = enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship
   const enemy = enc.ships.find((s) => s.id !== enc.playerShipId) ?? null
   const locked = view.busy || enc.status !== 'active'
-  const range = enemy && enemy.alive && !enemy.warpedOut ? distance(player.pos, enemy.pos) : null
+  // A cloaked contact has no range solution — hide the number everywhere.
+  const range =
+    enemy && enemy.alive && !enemy.warpedOut && !enemy.cloaked
+      ? distance(player.pos, enemy.pos)
+      : null
 
   const left = [
     powerPanel(player, draft, locked, ctx),
@@ -162,7 +167,36 @@ function helmPanel(
       draft.warpOut && !enginesUp,
     ),
   )
+  if (getShipClass(player.classId).hasCloak) body.push(...cloakControls(player, draft, locked, ctx))
   return panel('HELM', 'gold', body)
+}
+
+/** Cloaking device block: only rendered for classes with hasCloak. */
+function cloakControls(
+  player: ShipState,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): HTMLElement[] {
+  const enginesUp = player.subsystems.engines.hp > 0
+  const recharging = !player.cloaked && player.cloakCooldown > 0
+  const out: HTMLElement[] = [
+    btn(
+      'CLOAK',
+      () => {
+        draft.cloak = !draft.cloak
+        ctx.rerender()
+      },
+      { classes: 'wide', disabled: locked || recharging || !enginesUp, pressed: draft.cloak },
+    ),
+  ]
+  if (recharging) out.push(hint(`CLOAK RECHARGING — ${player.cloakCooldown} ROUNDS`))
+  else if (!enginesUp) out.push(hint('CLOAK UNAVAILABLE — ENGINES OFFLINE', true))
+  else if (!player.cloaked && draft.cloak) out.push(hint('ENGAGING — WEAPONS OFFLINE THIS ROUND'))
+  else if (player.cloaked && !draft.cloak) out.push(hint('DECLOAKING — WEAPONS FREE THIS ROUND'))
+  else if (player.cloaked) out.push(hint('CLOAKED — SHIELDS DOWN · NO WEAPONS FIRE'))
+  else out.push(hint('UNTARGETABLE WHILE CLOAKED · SHIELDS AND WEAPONS OFFLINE'))
+  return out
 }
 
 function tacticalPanel(
@@ -173,6 +207,8 @@ function tacticalPanel(
   ctx: ShellCtx,
 ): HTMLElement {
   const scanned = !!enemy && enemy.scanLevel >= 1
+  // A cloaked target gives the fire-control computer nothing to lock on.
+  const noSolution = !!enemy && enemy.cloaked
   const body: HTMLElement[] = [
     btn(
       'FIRE PHASERS',
@@ -180,7 +216,7 @@ function tacticalPanel(
         draft.firePhasers = !draft.firePhasers
         ctx.rerender()
       },
-      { classes: 'wide fire', disabled: locked || !enemy, pressed: draft.firePhasers },
+      { classes: 'wide fire', disabled: locked || !enemy || noSolution, pressed: draft.firePhasers },
     ),
     div('group-lbl', 'TARGETING'),
   ]
@@ -192,7 +228,7 @@ function tacticalPanel(
         draft.targetSubsystem = null
         ctx.rerender()
       },
-      { classes: 'sm', disabled: locked, pressed: draft.targetSubsystem === null },
+      { classes: 'sm', disabled: locked || noSolution, pressed: draft.targetSubsystem === null },
     ),
   )
   for (const sys of SUBSYSTEM_IDS) {
@@ -203,12 +239,17 @@ function tacticalPanel(
           draft.targetSubsystem = sys
           ctx.rerender()
         },
-        { classes: 'sm', disabled: locked || !scanned, pressed: draft.targetSubsystem === sys },
+        {
+          classes: 'sm',
+          disabled: locked || !scanned || noSolution,
+          pressed: draft.targetSubsystem === sys,
+        },
       ),
     )
   }
   body.push(targetRow)
-  if (!scanned) body.push(hint('SCAN REQUIRED FOR SUBSYSTEM TARGETING'))
+  if (noSolution) body.push(hint('TARGET CLOAKED — NO FIRING SOLUTION', true))
+  else if (!scanned) body.push(hint('SCAN REQUIRED FOR SUBSYSTEM TARGETING'))
   body.push(
     btn(
       `FIRE TORPEDO · ${player.torpedoes}`,
@@ -218,7 +259,7 @@ function tacticalPanel(
       },
       {
         classes: 'wide fire',
-        disabled: locked || !enemy || player.torpedoes < 1,
+        disabled: locked || !enemy || player.torpedoes < 1 || noSolution,
         pressed: draft.fireTorpedo,
         title: player.torpedoes < 1 ? 'TORPEDO MAGAZINE EMPTY' : 'NARROW FORWARD LAUNCH WINDOW',
       },
@@ -234,16 +275,25 @@ function sciencePanel(
   ctx: ShellCtx,
 ): HTMLElement {
   const scanned = !!enemy && enemy.scanLevel >= 1
+  // Against a cloaked contact the scan becomes a tachyon sweep — always worth
+  // running (even after a completed scan), so cloak overrides the scanned lock.
+  const cloaked = !!enemy && enemy.cloaked
   return panel('SCIENCE', 'slate', [
     btn(
-      'SCAN TARGET',
+      cloaked ? 'TACHYON SWEEP' : 'SCAN TARGET',
       () => {
         draft.scan = !draft.scan
         ctx.rerender()
       },
-      { classes: 'wide', disabled: locked || !enemy || scanned, pressed: draft.scan },
+      { classes: 'wide', disabled: locked || !enemy || (scanned && !cloaked), pressed: draft.scan },
     ),
-    hint(scanned ? 'TARGET SCANNED — FULL TELEMETRY ON TACTICAL' : 'REVEALS SHIELDS + SUBSYSTEMS · ENABLES TARGETING'),
+    hint(
+      cloaked
+        ? 'CHANCE TO FORCE DECLOAK SCALES WITH SENSOR POWER'
+        : scanned
+          ? 'TARGET SCANNED — FULL TELEMETRY ON TACTICAL'
+          : 'REVEALS SHIELDS + SUBSYSTEMS · ENABLES TARGETING',
+    ),
   ])
 }
 
@@ -313,16 +363,23 @@ function executeDock(
 ): HTMLElement {
   const over = totalAllocated(draft.power) > powerBudget(player)
   const dock = div('execute-dock')
-  dock.append(
-    btn(
-      view.busy ? 'RESOLVING…' : `EXECUTE ROUND ${enc.round}`,
-      () => ctx.callbacks.onExecuteRound(buildOrders(draft, game)),
-      {
-        classes: 'primary execute wide',
-        disabled: view.busy || over || enc.status !== 'active',
-      },
-    ),
+  const execute = btn(
+    view.busy ? 'RESOLVING…' : `EXECUTE ROUND ${enc.round}`,
+    () => ctx.callbacks.onExecuteRound(buildOrders(draft, game)),
+    {
+      classes: 'primary execute wide',
+      disabled: view.busy || over || enc.status !== 'active',
+      beep: 'execute',
+    },
   )
+  // Disabled buttons swallow clicks silently; the wrapper still hears the
+  // pointer (the disabled button is pointer-events: none) and denies audibly.
+  const wrap = div('execute-wrap')
+  wrap.append(execute)
+  wrap.addEventListener('pointerdown', () => {
+    if (execute.disabled) beep('deny')
+  })
+  dock.append(wrap)
   if (over && !view.busy) dock.append(hint('POWER OVER BUDGET — EXECUTE LOCKED', true))
   return dock
 }
@@ -343,6 +400,7 @@ function outcomeOverlay(
     btn(defeat ? 'ACKNOWLEDGE' : 'RETURN TO SECTOR', () => ctx.callbacks.onConcludeEncounter(), {
       classes: defeat ? 'danger' : 'primary',
       disabled: busy,
+      beep: 'confirm',
     }),
   )
   return box

@@ -43,10 +43,13 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
 
   const actions = div('menu-actions')
   actions.append(
-    btn('NEW MISSION', () => ctx.callbacks.onNewGame(parseSeed(ctx.ui.seedText)), {
-      classes: 'primary execute wide',
-    }),
+    btn(
+      'NEW MISSION',
+      () => ctx.callbacks.onNewGame(parseSeed(ctx.ui.seedText), { permadeath: ctx.ui.permadeath }),
+      { classes: 'primary execute wide', beep: 'confirm' },
+    ),
     seedRow,
+    difficultyControl(ctx),
   )
 
   const auto = view.saveSlots.find((s) => s.slot === 0)
@@ -55,6 +58,7 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
       classes: 'wide',
       disabled: !auto?.label,
       title: auto?.label ?? 'NO AUTOSAVE ON RECORD',
+      beep: 'confirm',
     }),
   )
   if (auto?.label) actions.append(hint(`AUTOSAVE — ${auto.label}`))
@@ -65,6 +69,7 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
       btn(`LOAD SLOT ${slot} — ${info?.label ?? 'EMPTY'}`, () => ctx.callbacks.onLoadSlot(slot), {
         classes: 'wide sm',
         disabled: !info?.label,
+        beep: 'confirm',
       }),
     )
   }
@@ -78,10 +83,37 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
     if (file) ctx.callbacks.onImportSave(file)
     fileInput.value = ''
   })
-  actions.append(btn('IMPORT SAVE FILE', () => fileInput.click(), { classes: 'wide sm' }), fileInput)
+  actions.append(
+    btn('IMPORT SAVE FILE', () => fileInput.click(), { classes: 'wide sm', beep: 'confirm' }),
+    fileInput,
+  )
 
   box.append(actions)
   return { left: decoRail(LEFT_DECO), right: decoRail(RIGHT_DECO), overlay: box, overlayMode: 'opaque' }
+}
+
+/** Two-option LCARS segmented control for the campaign difficulty setting. */
+function difficultyControl(ctx: ShellCtx): HTMLElement {
+  const wrap = div('menu-difficulty')
+  const seg = div('seg-ctl')
+  seg.append(
+    segOption('STANDARD', 'PERMADEATH', ctx.ui.permadeath, () => {
+      ctx.ui.permadeath = true
+      ctx.rerender()
+    }),
+    segOption("CAPTAIN'S MERCY", 'YOUR SHIP IS TOWED HOME ON DEFEAT', !ctx.ui.permadeath, () => {
+      ctx.ui.permadeath = false
+      ctx.rerender()
+    }),
+  )
+  wrap.append(div('group-lbl', 'DIFFICULTY'), seg)
+  return wrap
+}
+
+function segOption(name: string, desc: string, selected: boolean, onPick: () => void): HTMLElement {
+  const b = btn('', onPick, { classes: 'seg-opt', pressed: selected })
+  b.append(el('span', 'seg-name', name), el('span', 'seg-desc', desc))
+  return b
 }
 
 /** Optional numeric seed; anything blank/unparsable falls back to a random uint32. */

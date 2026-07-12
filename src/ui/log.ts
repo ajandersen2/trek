@@ -6,18 +6,33 @@ import type { ViewState } from './api'
 import { fmt1 } from './dom'
 import { OUTCOME_TITLES, SUB_LABELS, SUB_NOUNS } from './labels'
 
-const PHASER_BLOCKED: Record<'arc' | 'range' | 'weapons-down' | 'no-power', string> = {
+const PHASER_BLOCKED: Record<
+  'arc' | 'range' | 'weapons-down' | 'no-power' | 'target-cloaked' | 'self-cloaked',
+  string
+> = {
   arc: 'Phasers cannot bear on the target.',
   range: 'Target is beyond phaser range.',
   'weapons-down': 'Phaser array offline — fire order aborted.',
   'no-power': 'No power to weapons — phasers cold.',
+  'target-cloaked': 'No firing solution — target is cloaked.',
+  'self-cloaked': 'Weapons unavailable while cloaked.',
 }
 
-const TORPEDO_BLOCKED: Record<'arc' | 'ammo' | 'weapons-down' | 'no-power', string> = {
+const TORPEDO_BLOCKED: Record<
+  'arc' | 'ammo' | 'weapons-down' | 'no-power' | 'target-cloaked' | 'self-cloaked',
+  string
+> = {
   arc: 'Torpedo launch aborted — target outside the forward arc.',
   ammo: 'Torpedo magazine empty.',
   'weapons-down': 'Torpedo launcher offline.',
   'no-power': 'No power to weapons — torpedo tubes cold.',
+  'target-cloaked': 'No firing solution — target is cloaked.',
+  'self-cloaked': 'Weapons unavailable while cloaked.',
+}
+
+/** Ghost bearing indexes are 16ths of a circle: index × 22.5°, zero-padded ("~090"). */
+function bearingDegrees(index: number): string {
+  return String(Math.round(index * 22.5)).padStart(3, '0')
 }
 
 /** Convert resolved-round events into readable captain's-log lines. */
@@ -51,13 +66,33 @@ export function eventsToLog(events: RoundEvent[], view: ViewState): string[] {
         break
       case 'scan':
         if (isPlayer(e.shipId)) {
-          lines.push(
-            e.success
-              ? `Scan complete — ${nameOf(e.targetId)}'s shields and subsystems on tactical.`
-              : 'Sensor sweep failed — sensors are down.',
-          )
+          if (e.success) {
+            lines.push(`Scan complete — ${nameOf(e.targetId)}'s shields and subsystems on tactical.`)
+          } else if (typeof e.ghostBearing === 'number') {
+            // Failed tachyon sweep inside hint range: a rough contact bearing leaks.
+            lines.push(`Tachyon sweep: faint distortion bearing ~${bearingDegrees(e.ghostBearing)}.`)
+          } else if (shipOf(e.targetId)?.cloaked) {
+            lines.push('Tachyon sweep: no return.')
+          } else {
+            lines.push('Sensor sweep failed — sensors are down.')
+          }
         } else if (e.success) {
           lines.push(`${nameOf(e.shipId)} sweeps us with targeting sensors.`)
+        }
+        break
+      case 'cloak':
+        lines.push(`${nameOf(e.shipId)} shimmers out of existence.`)
+        break
+      case 'decloak':
+        lines.push(
+          e.forced
+            ? `TACHYON RETURN — ${nameOf(e.shipId)} forced out of cloak!`
+            : `${nameOf(e.shipId)} decloaks!`,
+        )
+        break
+      case 'cloak-blocked':
+        if (isPlayer(e.shipId)) {
+          lines.push(e.reason === 'cooldown' ? 'Cloak recharging.' : 'Cloak failed — engines are down.')
         }
         break
       case 'hail':
@@ -162,7 +197,7 @@ export function eventsToLog(events: RoundEvent[], view: ViewState): string[] {
 }
 
 const CRITICAL_RE =
-  /LOST WITH ALL HANDS|RED ALERT|DISABLED|FAILED|destroyed|dead in space|breaking up|brace for impact|scores a direct hit|Warp out failed/
+  /LOST WITH ALL HANDS|RED ALERT|DISABLED|FAILED|TACHYON RETURN|destroyed|dead in space|breaking up|brace for impact|scores a direct hit|Warp out failed/
 
 /** Color class for a captain's-log line (heuristics tuned to the UI voice above). */
 export function lineClass(line: string): string {

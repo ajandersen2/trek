@@ -105,7 +105,7 @@ describe('full M1 mission playthrough (sim-level integration)', () => {
       for (const hop of ['archer', 'hromi', 'veyra']) {
         const step = travelTo(s, hop)
         s = step.state
-        if (s.mode === 'encounter' && s.encounterContext === 'random') continue outer
+        if (s.mode === 'encounter' && s.encounterContext?.kind === 'random') continue outer
       }
       if (s.mode !== 'encounter') continue
       const aiRng = createRng(seed * 7 + 1)

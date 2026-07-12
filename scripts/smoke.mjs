@@ -82,17 +82,26 @@ try {
 
   // --- Execute one WEGO round through the callback path
   const round1 = await page.evaluate(() => window.__sc.view().game.encounter.round)
-  await page.evaluate(() => {
-    const v = window.__sc.view()
-    const ship = v.game.ship
-    window.__sc.callbacks.onExecuteRound({
-      shipId: ship.id,
-      helm: { turn: 0, throttle: 2 },
-      tactical: { firePhasers: { targetId: 'enemy', subsystem: null } },
-      engineering: { power: { engines: 2, shields: 3, weapons: 4, sensors: 1 }, repair: null },
-      science: { scanTargetId: 'enemy' },
+  const executeRound = () =>
+    page.evaluate(() => {
+      const v = window.__sc.view()
+      const ship = v.game.ship
+      const enemy = v.game.encounter.ships.find((s) => s.id !== ship.id)
+      const cloaked = enemy?.cloaked
+      window.__sc.callbacks.onExecuteRound({
+        shipId: ship.id,
+        helm: { turn: 0, throttle: cloaked ? 1 : 2 },
+        tactical: cloaked ? {} : { firePhasers: { targetId: 'enemy', subsystem: null } },
+        engineering: {
+          power: cloaked
+            ? { engines: 1, shields: 3, weapons: 0, sensors: 4 }
+            : { engines: 2, shields: 3, weapons: 4, sensors: 1 },
+          repair: null,
+        },
+        science: { scanTargetId: 'enemy' },
+      })
     })
-  })
+  await executeRound()
   // Round animation can take a few seconds.
   await page.waitForFunction(() => !window.__sc.isBusy(), undefined, { timeout: 30000 })
   const round2 = await page.evaluate(() => window.__sc.view().game.encounter.round)
@@ -104,6 +113,43 @@ try {
     () => document.querySelector('#app')?.textContent?.length ?? 0,
   )
   if (logText < 100) throw new Error('UI appears empty after a round')
+
+  // --- Fight the battle to a finish through the same path (cap 35 rounds)
+  for (let i = 0; i < 35; i++) {
+    const status = await page.evaluate(() => window.__sc.view().game.encounter?.status)
+    if (status && status !== 'active') break
+    await executeRound()
+    await page.waitForFunction(() => !window.__sc.isBusy(), undefined, { timeout: 30000 })
+  }
+  const finalStatus = await page.evaluate(() => window.__sc.view().game.encounter?.status)
+  if (!finalStatus || finalStatus === 'active') {
+    throw new Error(`battle did not finish in 35 rounds (status=${finalStatus})`)
+  }
+  if (finalStatus === 'defeat') throw new Error('smoke captain lost to the raider — balance?')
+  await shot('5-battle-end')
+
+  // --- Conclude: mission resolves, follow-up mission activates
+  await page.evaluate(() => window.__sc.callbacks.onConcludeEncounter())
+  const post = await page.evaluate(() => {
+    const v = window.__sc.view()
+    return {
+      screen: v.screen,
+      m1: v.game.missions[0]?.stage,
+      m2: v.game.missions[1]?.stage,
+      archive: v.game.logArchive.length,
+    }
+  })
+  if (post.screen !== 'sector') throw new Error(`expected sector after conclude, got ${post.screen}`)
+  if (post.m1 !== 'resolved') throw new Error(`m1 not resolved (${post.m1})`)
+  if (post.m2 !== 'active') throw new Error(`m2 did not activate (${post.m2})`)
+  if (post.archive < 10) throw new Error('log archive suspiciously empty')
+  await shot('6-mission-complete')
+
+  // --- Mute toggle exists and flips state
+  const mutedBefore = await page.evaluate(() => window.__sc.view().muted)
+  await page.evaluate(() => window.__sc.callbacks.onToggleMute())
+  const mutedAfter = await page.evaluate(() => window.__sc.view().muted)
+  if (mutedBefore === mutedAfter) throw new Error('mute toggle had no effect')
 
   if (problems.length) {
     fail('console/page errors during run')

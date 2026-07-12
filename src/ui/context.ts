@@ -7,12 +7,16 @@ import type { OrderDraft } from './draft'
 export interface UiState {
   /** Menu seed field text, preserved across idempotent re-renders. */
   seedText: string
+  /** Menu difficulty pick. Locked design default: permadeath on. */
+  permadeath: boolean
   /** In-progress order draft for the current encounter round. */
   draft: OrderDraft | null
   /** Identity of the encounter the draft belongs to (throttle carries within it). */
   encounterKey: string | null
   /** Identity of the round the draft belongs to (draft resets when it changes). */
   roundKey: string | null
+  /** Full-screen overlay currently open (captain's-log archive / how-to-play). */
+  overlay: 'log' | 'help' | null
 }
 
 export interface ShellCtx {

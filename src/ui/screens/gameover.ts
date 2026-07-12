@@ -9,7 +9,7 @@ export function gameOverScreen(game: GameState, ctx: ShellCtx): ScreenContent {
   box.append(
     div('outcome-title blink', `${game.ship.name.toUpperCase()} — LOST WITH ALL HANDS`),
     div('outcome-sub', `STARDATE ${game.galaxy.stardate.toFixed(1)} — ALL STATIONS SILENT`),
-    btn('RETURN TO MAIN MENU', () => ctx.callbacks.onMainMenu(), { classes: 'danger' }),
+    btn('RETURN TO MAIN MENU', () => ctx.callbacks.onMainMenu(), { classes: 'danger', beep: 'confirm' }),
   )
   return { left: [], right: [], overlay: box, overlayMode: 'opaque' }
 }
