@@ -10,7 +10,7 @@ import { TACTICAL_SCENE_KEY, TacticalScene } from './tacticalScene'
 
 export const createRender: CreateRender = async (parent, callbacks) => {
   const sector = new SectorScene(callbacks)
-  const tactical = new TacticalScene()
+  const tactical = new TacticalScene(callbacks) // replay emits onCue sound cues
 
   const game = await new Promise<Phaser.Game>((resolve) => {
     new Phaser.Game({

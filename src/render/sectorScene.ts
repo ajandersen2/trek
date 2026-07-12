@@ -1,9 +1,10 @@
-// Sector map scene: seeded starfield, warp lanes, system glyphs, mission
-// target ring, player marker, selection highlight. Reads GameState only and
-// emits map clicks through RenderCallbacks; a full redraw per showSector /
-// resize is cheap at this scale.
+// Sector map scene: seeded nebula + starfield, warp lanes, system glyphs,
+// mission target rings, player marker, selection highlight. Reads GameState
+// only and emits map clicks through RenderCallbacks; a full redraw per
+// showSector / resize is cheap at this scale.
 
 import Phaser from 'phaser'
+import { getMissionDef } from '../data/missions'
 import { SYSTEMS } from '../data/sectors'
 import type { StarSystem, SystemType } from '../sim/galaxy'
 import type { GameState } from '../sim/game'
@@ -13,6 +14,7 @@ import { fillGlowDot, strokeArcSegment, strokeGlowCircle } from './fx'
 import { drawMarkerArrow } from './silhouettes'
 import { fitMapProjection, projectMap, type Projection } from './project'
 import { mulberry32 } from './prng'
+import { SECTOR_NEBULA_HUES, drawNebula, makeNebula, type NebulaBlob } from './nebula'
 
 export const SECTOR_SCENE_KEY = 'sector'
 
@@ -41,11 +43,14 @@ export class SectorScene extends Phaser.Scene {
   private selectedId: string | null = null
   private starSeed: number | null = null
   private stars: Star[] = []
+  private nebulaSeed: number | null = null
+  private nebula: NebulaBlob[] = []
+  private nebulaGfx!: Phaser.GameObjects.Graphics
   private starGfx!: Phaser.GameObjects.Graphics
   private laneGfx!: Phaser.GameObjects.Graphics
   private selectGfx!: Phaser.GameObjects.Graphics
   private nodes = new Map<string, SystemNode>()
-  private missionRing: Phaser.GameObjects.Container | null = null
+  private missionRings: Phaser.GameObjects.Container[] = []
   private marker: Phaser.GameObjects.Container | null = null
   private proj: Projection = { scale: 1, ox: 0, oy: 0 }
 
@@ -55,6 +60,7 @@ export class SectorScene extends Phaser.Scene {
   }
 
   create(): void {
+    this.nebulaGfx = this.add.graphics().setDepth(-1) // behind the starfield
     this.starGfx = this.add.graphics().setDepth(0)
     this.laneGfx = this.add.graphics().setDepth(1)
     this.selectGfx = this.add.graphics().setDepth(3)
@@ -86,8 +92,8 @@ export class SectorScene extends Phaser.Scene {
       node.container.destroy()
     }
     this.nodes.clear()
-    this.missionRing?.destroy()
-    this.missionRing = null
+    for (const ring of this.missionRings) ring.destroy()
+    this.missionRings = []
     this.marker?.destroy()
     this.marker = null
 
@@ -95,12 +101,21 @@ export class SectorScene extends Phaser.Scene {
     const h = this.scale.height
     this.proj = fitMapProjection(w, h, MAP_MARGIN_FRAC)
 
+    this.drawNebulaBackdrop(state.seed, w, h)
     this.drawStars(state.seed, w, h)
     this.drawLanes(state)
     for (const sys of Object.values(SYSTEMS)) this.addSystemNode(sys, state)
-    this.addMissionRing(state)
+    this.addMissionRings(state)
     this.addPlayerMarker(state)
     this.drawSelection()
+  }
+
+  private drawNebulaBackdrop(seed: number, w: number, h: number): void {
+    if (this.nebulaSeed !== seed) {
+      this.nebula = makeNebula(seed ^ 0x1b6e3a2d, SECTOR_NEBULA_HUES) // decorrelate from stars
+      this.nebulaSeed = seed
+    }
+    drawNebula(this.nebulaGfx, this.nebula, w, h)
   }
 
   private drawStars(seed: number, w: number, h: number): void {
@@ -209,20 +224,29 @@ export class SectorScene extends Phaser.Scene {
     }
   }
 
-  private addMissionRing(state: GameState): void {
-    if (state.mission.stage !== 'active') return
-    const target = SYSTEMS[state.mission.targetSystemId]
-    if (!target) return
-    const p = projectMap(this.proj, target.pos)
-    const g = this.add.graphics()
-    const seg = (Math.PI * 2) / 5
-    for (let i = 0; i < 5; i++) {
-      strokeArcSegment(g, 0, 0, 15, i * seg, seg * 0.28, 3.5, COLORS.torpedo, 0.25)
-      strokeArcSegment(g, 0, 0, 15, i * seg, seg * 0.28, 1.6, COLORS.torpedo, 0.9)
+  /**
+   * Target rings: every ACTIVE mission whose def trigger is 'at-system' marks
+   * its target system (multiple rings possible). Intercept-after missions
+   * hunt the player between systems and get no marker; zero rings is normal.
+   */
+  private addMissionRings(state: GameState): void {
+    for (const rec of state.missions) {
+      if (rec.stage !== 'active') continue
+      const def = getMissionDef(rec.defId)
+      if (def.trigger.type !== 'at-system') continue
+      const target = SYSTEMS[def.trigger.systemId]
+      if (!target) continue
+      const p = projectMap(this.proj, target.pos)
+      const g = this.add.graphics()
+      const seg = (Math.PI * 2) / 5
+      for (let i = 0; i < 5; i++) {
+        strokeArcSegment(g, 0, 0, 15, i * seg, seg * 0.28, 3.5, COLORS.torpedo, 0.25)
+        strokeArcSegment(g, 0, 0, 15, i * seg, seg * 0.28, 1.6, COLORS.torpedo, 0.9)
+      }
+      const ring = this.add.container(p.x, p.y, [g]).setDepth(2)
+      this.tweens.add({ targets: ring, props: { rotation: Math.PI * 2 }, duration: 9000, repeat: -1 })
+      this.missionRings.push(ring)
     }
-    const ring = this.add.container(p.x, p.y, [g]).setDepth(2)
-    this.tweens.add({ targets: ring, props: { rotation: Math.PI * 2 }, duration: 9000, repeat: -1 })
-    this.missionRing = ring
   }
 
   private addPlayerMarker(state: GameState): void {

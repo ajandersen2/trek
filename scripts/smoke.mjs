@@ -82,21 +82,43 @@ try {
 
   // --- Execute one WEGO round through the callback path
   const round1 = await page.evaluate(() => window.__sc.view().game.encounter.round)
+  // A competent captain (mirrors the 'balanced' policy from scripts/balance.ts):
+  // steer onto the target, cut throttle when it camps our rear arc, triage
+  // repairs, sweep hard when it cloaks. Test-side code may use atan2 freely.
   const executeRound = () =>
     page.evaluate(() => {
       const v = window.__sc.view()
       const ship = v.game.ship
+      const me = v.game.encounter.ships.find((s) => s.id === ship.id)
       const enemy = v.game.encounter.ships.find((s) => s.id !== ship.id)
       const cloaked = enemy?.cloaked
+      const dx = enemy.pos.x - me.pos.x
+      const dy = enemy.pos.y - me.pos.y
+      const dist = Math.sqrt(dx * dx + dy * dy)
+      const desired = Math.round((Math.atan2(dy, dx) * 8) / Math.PI + 16) % 16
+      let turn = desired - me.heading
+      while (turn > 8) turn -= 16
+      while (turn <= -8) turn += 16
+      const behind = Math.abs(turn) >= 4
+      let throttle
+      if (cloaked) throttle = 1
+      else if (behind && dist < 9) throttle = 0
+      else if (dist > 12) throttle = 2
+      else if (dist > 6) throttle = 2
+      else throttle = 1
+      const repair =
+        ['weapons', 'engines', 'shields', 'sensors'].find(
+          (sys) => me.subsystems[sys].hp > 0 && me.subsystems[sys].hp / me.subsystems[sys].maxHp < 0.5,
+        ) ?? null
       window.__sc.callbacks.onExecuteRound({
         shipId: ship.id,
-        helm: { turn: 0, throttle: cloaked ? 1 : 2 },
+        helm: { turn, throttle },
         tactical: cloaked ? {} : { firePhasers: { targetId: 'enemy', subsystem: null } },
         engineering: {
           power: cloaked
             ? { engines: 1, shields: 3, weapons: 0, sensors: 4 }
             : { engines: 2, shields: 3, weapons: 4, sensors: 1 },
-          repair: null,
+          repair,
         },
         science: { scanTargetId: 'enemy' },
       })

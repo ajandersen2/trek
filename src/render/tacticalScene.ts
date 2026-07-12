@@ -2,14 +2,20 @@
 // a sequential animation. Display state (ship views, torpedo dots) is
 // render-owned deep copies — the final redraw from finalState is the single
 // source of truth after every round, so animation drift can never accumulate.
+//
+// Fog of war lives HERE, not in the sim: the sim emits true coordinates for
+// cloaked ships (events + finalState), and this layer is what keeps them off
+// the screen — silhouettes, movement, labels, camera fit, even launch flashes.
 
 import Phaser from 'phaser'
 import { getShipClass } from '../data/ships'
 import { headingDelta, type ArcId, type Vec2 } from '../sim/geometry'
-import { ARC_IDS, type EncounterState, type RoundEvent, type ShipState } from '../sim/types'
+import { ARC_IDS, type EncounterState, type FactionId, type RoundEvent, type ShipState } from '../sim/types'
+import type { RenderCallbacks } from './api'
 import { COLORS, FONT_STACK, css, hullColor, mix } from './palette'
 import { drawBeam, fillGlowDot, strokeArcSegment, strokeGlowLine } from './fx'
-import { beamColor, drawShip, drawWreck, factionColor, hullFragments } from './silhouettes'
+import { beamColor, drawShip, drawWreck, hullFragments, shipColor } from './silhouettes'
+import { TACTICAL_NEBULA_HUES, drawNebula, makeNebula, type NebulaBlob } from './nebula'
 import {
   boundsOf,
   fitProjection,
@@ -30,6 +36,13 @@ const FIT_MARGIN = 36 // px kept clear inside the canvas edge
 const PROJ_TWEEN_MS = 400
 const ROUND_BUDGET_MS = 6500
 const GRID_STEP = 5 // sim units between range rings
+const GHOST_ALPHA = 0.35 // player's own cloaked ship
+const GHOST_WEDGE_LEN = 12 // sim units: failed-sweep bearing hint reach
+const CLOAK_MS = 700
+const DECLOAK_MS = 600
+// EncounterState carries no seed (the render contract keeps it lean), so the
+// tactical haze uses a fixed display-only seed with the shared generator.
+const TACTICAL_NEBULA_SEED = 0x7a3c9e1
 
 // Shield-arc center angles in the rotated rig frame: +X is the facing, and
 // after the sim→screen Y flip local +Y (screen down) is the starboard side.
@@ -43,6 +56,7 @@ const ARC_HALF = Math.PI / 4 - 0.1 // 90° quadrant minus a visual gap
 
 type HelmEvent = Extract<RoundEvent, { type: 'helm' }>
 type TorpedoMoveEvent = Extract<RoundEvent, { type: 'torpedo-move' }>
+type ScanEvent = Extract<RoundEvent, { type: 'scan' }>
 
 type Step =
   | { kind: 'helm'; events: HelmEvent[] }
@@ -69,9 +83,12 @@ interface TorpedoView {
 }
 
 export class TacticalScene extends Phaser.Scene {
+  private readonly callbacks: RenderCallbacks
   private board: EncounterState | null = null
   private views = new Map<string, ShipView>()
   private torps = new Map<number, TorpedoView>()
+  private nebulaGfx!: Phaser.GameObjects.Graphics
+  private nebulaBlobs: NebulaBlob[] = []
   private gridG!: Phaser.GameObjects.Graphics
   private fxLayer!: Phaser.GameObjects.Container
   private proj: Projection = { scale: 10, ox: 0, oy: 0 }
@@ -81,11 +98,15 @@ export class TacticalScene extends Phaser.Scene {
   private pending = new Set<() => void>()
   private floatSlots = new Map<string, number>()
 
-  constructor() {
+  constructor(callbacks: RenderCallbacks) {
     super(TACTICAL_SCENE_KEY)
+    this.callbacks = callbacks
   }
 
   create(): void {
+    this.nebulaGfx = this.add.graphics().setDepth(-1) // behind everything
+    this.nebulaBlobs = makeNebula(TACTICAL_NEBULA_SEED, TACTICAL_NEBULA_HUES, 24)
+    drawNebula(this.nebulaGfx, this.nebulaBlobs, this.scale.width, this.scale.height)
     this.gridG = this.add.graphics().setDepth(0)
     this.fxLayer = this.add.container(0, 0).setDepth(5)
     this.scale.on(Phaser.Scale.Events.RESIZE, this.onResize, this)
@@ -166,9 +187,37 @@ export class TacticalScene extends Phaser.Scene {
     })
   }
 
+  // -------------------------------------------------------------- sound cues
+
+  /**
+   * Emit this event's sound cues (see cuesForEvent) at its animation moment.
+   * Silent while fast-forwarding — a skipped replay must not machine-gun the
+   * mixer — and silent for events suppressed by the cloak fog of war.
+   */
+  private emitCues(ev: RoundEvent): void {
+    if (this.ff || !this.callbacks.onCue) return
+    const shooterFaction: FactionId =
+      ev.type === 'phaser-fire'
+        ? (this.views.get(ev.shooterId)?.ship.faction ?? 'federation')
+        : 'federation'
+    for (const cue of cuesForEvent(ev, shooterFaction)) this.callbacks.onCue(cue)
+  }
+
+  /** Is this ship id currently concealed by its cloak? */
+  private isHiddenId(shipId: string): boolean {
+    const view = this.views.get(shipId)
+    return view ? this.isHiddenView(view) : false
+  }
+
+  /** Cloaked ships are absent from the display — except the player's own ghost. */
+  private isHiddenView(view: ShipView): boolean {
+    return view.ship.cloaked && view.ship.id !== this.board?.playerShipId
+  }
+
   // ------------------------------------------------------------- static draw
 
   private onResize(): void {
+    drawNebula(this.nebulaGfx, this.nebulaBlobs, this.scale.width, this.scale.height)
     if (!this.board) return
     this.tweens.killTweensOf(this.proj)
     this.proj = this.fitTo(this.currentBounds())
@@ -180,19 +229,25 @@ export class TacticalScene extends Phaser.Scene {
       this.fastForwardNow()
       this.tweens.killAll()
       this.fxLayer.removeAll(true)
+      drawNebula(this.nebulaGfx, this.nebulaBlobs, this.scale.width, this.scale.height)
     }
     this.tweens.killTweensOf(this.proj)
     this.clearViews()
     this.board = state
 
     const present = state.ships.filter((s) => !s.warpedOut)
-    if (present.length > 0) {
+    // Grid center and camera fit only consider what the player can see:
+    // a cloaked enemy's true position must not steer the display.
+    const seen = present.filter((s) => !s.cloaked || s.id === state.playerShipId)
+    if (seen.length > 0) {
       this.gridCenter = {
-        x: present.reduce((acc, s) => acc + s.pos.x, 0) / present.length,
-        y: present.reduce((acc, s) => acc + s.pos.y, 0) / present.length,
+        x: seen.reduce((acc, s) => acc + s.pos.x, 0) / seen.length,
+        y: seen.reduce((acc, s) => acc + s.pos.y, 0) / seen.length,
       }
     }
     this.proj = this.fitTo(boardBounds(state))
+    // Views exist for hidden ships too (invisible), silently tracking pose so
+    // a later decloak materializes exactly where the sim says it is.
     for (const ship of present) this.views.set(ship.id, this.createShipView(ship))
     for (const torp of state.torpedoes) {
       this.torps.set(torp.id, this.createTorpedoView(torp.pos, headingToRotation(torp.heading)))
@@ -223,7 +278,10 @@ export class TacticalScene extends Phaser.Scene {
 
   private currentBounds(): Bounds {
     const pts: Vec2[] = []
-    for (const view of this.views.values()) pts.push({ x: view.world.x, y: view.world.y })
+    for (const view of this.views.values()) {
+      if (this.isHiddenView(view)) continue // hidden contacts must not steer the camera
+      pts.push({ x: view.world.x, y: view.world.y })
+    }
     for (const torp of this.torps.values()) pts.push({ x: torp.world.x, y: torp.world.y })
     return boundsOf(pts, WORLD_PAD)
   }
@@ -246,7 +304,7 @@ export class TacticalScene extends Phaser.Scene {
     const container = this.add.container(0, 0, [rig, hullG, label]).setDepth(2)
     const view: ShipView = {
       ship,
-      shieldMax: getShipClass(ship.classId).shieldMax,
+      shieldMax: shieldMaxFor(ship),
       container,
       rig,
       body,
@@ -256,6 +314,7 @@ export class TacticalScene extends Phaser.Scene {
       world: { x: ship.pos.x, y: ship.pos.y, rot: ship.heading },
     }
     this.redrawShip(view)
+    this.applyCloakLook(view)
     return view
   }
 
@@ -263,12 +322,40 @@ export class TacticalScene extends Phaser.Scene {
     view.body.clear()
     view.shieldsG.clear()
     if (view.ship.alive) {
-      drawShip(view.body, view.ship.faction, SHIP_PX)
+      drawShip(view.body, view.ship.classId, view.ship.faction, SHIP_PX)
       this.drawShieldArcs(view)
     } else {
-      drawWreck(view.body, view.ship.faction, SHIP_PX)
+      drawWreck(view.body, view.ship.classId, view.ship.faction, SHIP_PX)
     }
     this.drawHullBar(view)
+  }
+
+  /**
+   * Static cloak treatment. A hidden enemy is simply absent — no silhouette,
+   * hull bar, or label. The player's own cloaked ship stays as a ~35% ghost
+   * with a soft shimmer: the captain always knows where their own ship is.
+   */
+  private applyCloakLook(view: ShipView): void {
+    this.tweens.killTweensOf(view.rig) // clear any prior shimmer before restyling
+    view.rig.setScale(1)
+    view.rig.setAlpha(1)
+    if (!view.ship.cloaked) {
+      view.container.setVisible(true).setAlpha(1)
+      return
+    }
+    if (view.ship.id === this.board?.playerShipId) {
+      view.container.setVisible(true).setAlpha(GHOST_ALPHA)
+      this.tweens.add({
+        targets: view.rig,
+        props: { alpha: 0.7 },
+        duration: 900,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut',
+      })
+    } else {
+      view.container.setVisible(false).setAlpha(1)
+    }
   }
 
   /** Enemy shield/subsystem detail is hidden until scanned (scanLevel >= 1). */
@@ -316,14 +403,20 @@ export class TacticalScene extends Phaser.Scene {
 
   private createTorpedoView(pos: Vec2, rotation: number): TorpedoView {
     const g = this.add.graphics()
+    g.setBlendMode(Phaser.BlendModes.ADD) // trail beads sum into a hot plasma glow
     fillGlowDot(g, 0, 0, 2.6, COLORS.torpedo)
     // Fading trail behind the flight direction (local -X).
-    g.fillStyle(COLORS.torpedo, 0.5)
-    g.fillCircle(-7, 0, 1.8)
-    g.fillStyle(COLORS.torpedo, 0.28)
-    g.fillCircle(-12, 0, 1.4)
-    g.fillStyle(COLORS.torpedo, 0.12)
-    g.fillCircle(-17, 0, 1)
+    const trail = [
+      { x: -7, r: 1.9, a: 0.5 },
+      { x: -12, r: 1.6, a: 0.32 },
+      { x: -17, r: 1.3, a: 0.2 },
+      { x: -22, r: 1.05, a: 0.12 },
+      { x: -27, r: 0.8, a: 0.06 },
+    ]
+    for (const t of trail) {
+      g.fillStyle(COLORS.torpedo, t.a)
+      g.fillCircle(t.x, 0, t.r)
+    }
     const container = this.add.container(0, 0, [g]).setDepth(3)
     container.setRotation(rotation)
     const view: TorpedoView = { container, world: { x: pos.x, y: pos.y } }
@@ -419,6 +512,17 @@ export class TacticalScene extends Phaser.Scene {
     const view = this.views.get(ev.shipId)
     if (!view) return Promise.resolve()
     const rotTo = view.world.rot + headingDelta(ev.headingFrom, ev.headingTo)
+    if (this.isHiddenView(view)) {
+      // The sim emits true movement for cloaked ships; concealing it is the
+      // render layer's job (fog of war lives here, not in the sim). Snap the
+      // pose silently — no tween — so a later decloak appears in the right
+      // place without the ghost's track ever being drawn.
+      view.world.x = ev.to.x
+      view.world.y = ev.to.y
+      view.world.rot = rotTo
+      this.applyShip(view)
+      return Promise.resolve()
+    }
     return this.tweenAsync({
       targets: view.world,
       props: { x: ev.to.x, y: ev.to.y, rot: rotTo },
@@ -450,9 +554,23 @@ export class TacticalScene extends Phaser.Scene {
   }
 
   private async runEvent(ev: RoundEvent, k: number): Promise<void> {
+    // Cues fire at each event's animation moment. phaser-fire emits at beam
+    // draw (after the charge glow) and decloak at shimmer start, inside their
+    // handlers; a launch from a still-cloaked ship stays silent — even the
+    // sound would betray it.
+    const cueInHandler = ev.type === 'phaser-fire' || ev.type === 'decloak'
+    const hiddenLaunch = ev.type === 'torpedo-launch' && this.isHiddenId(ev.ownerId)
+    if (!cueInHandler && !hiddenLaunch) this.emitCues(ev)
     switch (ev.type) {
       case 'torpedo-launch': {
         this.torps.get(ev.id)?.container.destroy()
+        this.torps.delete(ev.id)
+        if (hiddenLaunch) {
+          // No tube flash at a cloaked launcher's true position; the torpedo
+          // itself materializes on its first tracked move.
+          await this.wait(140 * k)
+          return
+        }
         const target = this.views.get(ev.targetId)
         const rotation = target
           ? Math.atan2(-(target.world.y - ev.pos.y), target.world.x - ev.pos.x)
@@ -529,7 +647,7 @@ export class TacticalScene extends Phaser.Scene {
         return
       }
       case 'scan': {
-        await this.animateScan(ev.shipId, ev.targetId, ev.success, k)
+        await this.animateScan(ev, k)
         return
       }
       case 'hail': {
@@ -538,6 +656,14 @@ export class TacticalScene extends Phaser.Scene {
       }
       case 'warp-out': {
         await this.animateWarpOut(ev.shipId, k)
+        return
+      }
+      case 'cloak': {
+        await this.animateCloak(ev.shipId, k)
+        return
+      }
+      case 'decloak': {
+        await this.animateDecloak(ev, k)
         return
       }
       case 'ship-destroyed': {
@@ -554,7 +680,8 @@ export class TacticalScene extends Phaser.Scene {
           props: { t: 1 },
           duration: 620 * k,
           onUpdate: () => {
-            view.rig.setAlpha(0.35 + 0.65 * Math.abs(Math.cos(anim.t * Math.PI * 3)))
+            // Subtle ember flicker — a powerless hulk, not a strobe.
+            view.rig.setAlpha(0.55 + 0.3 * Math.abs(Math.cos(anim.t * Math.PI * 3)))
           },
         })
         view.rig.setAlpha(0.55) // dim ember until the final redraw
@@ -579,10 +706,30 @@ export class TacticalScene extends Phaser.Scene {
       const ang = Math.atan2(dy, dx) + 0.16 * sign
       to = { x: ev.from.x + Math.cos(ang) * len * 1.18, y: ev.from.y + Math.sin(ang) * len * 1.18 }
     }
-    const g = this.add.graphics()
-    this.fxLayer.add(g)
     const a = project(this.proj, ev.from)
     const b = project(this.proj, to)
+
+    // Brief pre-fire charge: the emitter gathers light for ~80ms before the beam.
+    if (!this.ff) {
+      const charge = this.add.graphics()
+      this.fxLayer.add(charge)
+      const cAnim = { t: 0 }
+      await this.tweenAsync({
+        targets: cAnim,
+        props: { t: 1 },
+        duration: 80 * k,
+        ease: 'Sine.easeIn',
+        onUpdate: () => {
+          charge.clear()
+          fillGlowDot(charge, a.x, a.y, 1 + 2.6 * cAnim.t, mix(color, COLORS.white, 0.3), 0.4 + 0.6 * cAnim.t)
+        },
+      })
+      charge.destroy()
+    }
+
+    this.emitCues(ev) // beam voice + impact bell land with the drawn beam
+    const g = this.add.graphics()
+    this.fxLayer.add(g)
     drawBeam(g, a.x, a.y, b.x, b.y, color)
 
     const target = this.views.get(ev.targetId)
@@ -607,16 +754,25 @@ export class TacticalScene extends Phaser.Scene {
     g.destroy()
   }
 
-  private async animateScan(shipId: string, targetId: string, success: boolean, k: number): Promise<void> {
-    const scanner = this.views.get(shipId)
-    const target = this.views.get(targetId)
-    if (!scanner || !target) {
+  private async animateScan(ev: ScanEvent, k: number): Promise<void> {
+    const scanner = this.views.get(ev.shipId)
+    if (!scanner || this.isHiddenView(scanner)) {
+      // A cloaked ship may still sweep (the sim allows it), but rings centered
+      // on empty space would hand over exactly the position the cloak hides.
+      // The 'scan' cue already played — an unseen sweep you can only hear.
       await this.wait(200 * k)
       return
     }
+    const target = this.views.get(ev.targetId)
+    const targetSeen = target !== undefined && !this.isHiddenView(target)
     const a = project(this.proj, scanner.world)
-    const b = project(this.proj, target.world)
-    const reach = Math.hypot(b.x - a.x, b.y - a.y) + 26
+    // Never size the pulse off a hidden contact's true position — a failed
+    // tachyon sweep reads as a fixed-radius search, not a rangefinder.
+    let reach = GHOST_WEDGE_LEN * this.proj.scale
+    if (targetSeen) {
+      const b = project(this.proj, target.world)
+      reach = Math.hypot(b.x - a.x, b.y - a.y) + 26
+    }
     const g = this.add.graphics()
     this.fxLayer.add(g)
     const anim = { t: 0 }
@@ -635,7 +791,7 @@ export class TacticalScene extends Phaser.Scene {
       },
     })
     g.destroy()
-    if (success) {
+    if (ev.success && target) {
       target.ship.scanLevel = Math.max(target.ship.scanLevel, 1)
       this.redrawShip(target) // readout (shield arcs) brightens in
       if (!this.ff) {
@@ -647,13 +803,43 @@ export class TacticalScene extends Phaser.Scene {
           repeat: 1,
         })
       }
+    } else if (ev.ghostBearing !== null && ev.ghostBearing !== undefined) {
+      // Failed sweep inside hint range: faint distortion bearing, no fix.
+      this.spawnGhostWedge(scanner, ev.ghostBearing)
     }
     await this.wait(120 * k)
   }
 
+  /**
+   * Translucent lavender bearing wedge from the scanner toward the quantized
+   * ghost heading (22.5° spread, ~12 world units), fading over ~1s.
+   */
+  private spawnGhostWedge(scanner: ShipView, bearing: number): void {
+    if (this.ff) return
+    const p = project(this.proj, scanner.world)
+    const len = GHOST_WEDGE_LEN * this.proj.scale
+    const center = headingToRotation(bearing) // sim heading → screen radians
+    const half = Math.PI / 16
+    const g = this.add.graphics()
+    this.fxLayer.add(g)
+    g.fillStyle(COLORS.lavender, 0.13)
+    g.slice(p.x, p.y, len, center - half, center + half, false)
+    g.fillPath()
+    g.lineStyle(1.2, COLORS.lavender, 0.45)
+    g.slice(p.x, p.y, len, center - half, center + half, false)
+    g.strokePath()
+    this.tweens.add({
+      targets: g,
+      props: { alpha: 0 },
+      duration: 1000,
+      ease: 'Sine.easeIn',
+      onComplete: () => g.destroy(),
+    })
+  }
+
   private async animateHail(shipId: string, k: number): Promise<void> {
     const view = this.views.get(shipId)
-    if (!view) return
+    if (!view || this.isHiddenView(view)) return // a hidden hailer stays unseen
     const g = this.add.graphics()
     fillGlowDot(g, 0, 0, 1.6, COLORS.peach)
     // Two signal arcs opening upward (screen angles: -π/2 is up).
@@ -684,6 +870,13 @@ export class TacticalScene extends Phaser.Scene {
     const view = this.views.get(shipId)
     if (!view) return
     this.views.delete(shipId)
+    if (this.isHiddenView(view)) {
+      // A cloaked ship jumps out unseen: no streak at its true position.
+      this.tweens.killTweensOf(view.world)
+      view.container.destroy()
+      await this.wait(160 * k)
+      return
+    }
     const theta = (view.world.rot * Math.PI) / 8 // sim-space facing angle
     const dir = { x: Math.cos(theta), y: Math.sin(theta) }
     const p0 = project(this.proj, view.world)
@@ -691,7 +884,7 @@ export class TacticalScene extends Phaser.Scene {
     if (!this.ff) {
       const streak = this.add.graphics()
       this.fxLayer.add(streak)
-      drawBeam(streak, p0.x, p0.y, p1.x, p1.y, mix(factionColor(view.ship.faction), COLORS.white, 0.4))
+      drawBeam(streak, p0.x, p0.y, p1.x, p1.y, mix(shipColor(view.ship.classId, view.ship.faction), COLORS.white, 0.4))
       this.tweens.add({
         targets: streak,
         props: { alpha: 0 },
@@ -727,49 +920,176 @@ export class TacticalScene extends Phaser.Scene {
     await this.wait(120 * k)
   }
 
+  /** Shimmer-out: the silhouette dissolves into drifting slices, then hides. */
+  private async animateCloak(shipId: string, k: number): Promise<void> {
+    const view = this.views.get(shipId)
+    if (!view) return
+    view.ship.cloaked = true
+    const endAlpha = shipId === this.board?.playerShipId ? GHOST_ALPHA : 0
+    this.spawnCloakSlices(view, false, CLOAK_MS * k)
+    const anim = { t: 0 }
+    await this.tweenAsync({
+      targets: anim,
+      props: { t: 1 },
+      duration: CLOAK_MS * k,
+      ease: 'Sine.easeIn',
+      onUpdate: () => {
+        view.container.setAlpha(1 - (1 - endAlpha) * anim.t)
+        view.rig.setScale(1, 1 + 0.07 * Math.sin(anim.t * Math.PI * 4)) // ripple
+      },
+    })
+    this.applyCloakLook(view)
+    await this.wait(100 * k)
+  }
+
+  /** Shimmer-in. A forced decloak (tachyon lock / dead engines) flashes first. */
+  private async animateDecloak(ev: Extract<RoundEvent, { type: 'decloak' }>, k: number): Promise<void> {
+    const view = this.views.get(ev.shipId)
+    if (!view) return
+    if (ev.forced) {
+      // Detection flash: the lavender ring that caught them.
+      this.spawnRing({ x: view.world.x, y: view.world.y }, 20, COLORS.lavender, 340 * k)
+      await this.wait(170 * k)
+    }
+    this.emitCues(ev) // cue at shimmer start
+    this.tweens.killTweensOf(view.rig) // stop any ghost shimmer mid-oscillation
+    view.rig.setAlpha(1)
+    view.ship.cloaked = false
+    const fromAlpha = ev.shipId === this.board?.playerShipId ? GHOST_ALPHA : 0
+    view.container.setVisible(true).setAlpha(fromAlpha)
+    this.spawnCloakSlices(view, true, DECLOAK_MS * k)
+    const anim = { t: 0 }
+    await this.tweenAsync({
+      targets: anim,
+      props: { t: 1 },
+      duration: DECLOAK_MS * k,
+      ease: 'Sine.easeOut',
+      onUpdate: () => {
+        view.container.setAlpha(fromAlpha + (1 - fromAlpha) * anim.t)
+        view.rig.setScale(1, 1 + 0.06 * Math.sin((1 - anim.t) * Math.PI * 4))
+      },
+    })
+    this.applyCloakLook(view)
+    await this.wait(80 * k)
+  }
+
+  /** Two ghost silhouette slices sliding horizontally apart (or back together). */
+  private spawnCloakSlices(view: ShipView, converge: boolean, ms: number): void {
+    if (this.ff) return
+    const p = project(this.proj, view.world)
+    const rot = headingToRotation(view.world.rot)
+    for (const dir of [-1, 1]) {
+      const g = this.add.graphics()
+      drawShip(g, view.ship.classId, view.ship.faction, SHIP_PX, 0.45)
+      g.setRotation(rot)
+      g.setPosition(p.x + (converge ? dir * 10 : dir * 2), p.y + dir * 1.5)
+      g.setAlpha(0.5)
+      this.fxLayer.add(g)
+      this.tweens.add({
+        targets: g,
+        props: { x: converge ? p.x + dir * 2 : p.x + dir * 10, alpha: 0 },
+        duration: ms,
+        ease: 'Sine.easeOut',
+        onComplete: () => g.destroy(),
+      })
+    }
+  }
+
+  /**
+   * Three-stage destruction, ~1.6s with the ember tail: white core flash →
+   * secondary blasts cooking off around the hull → tumbling debris shards
+   * under a lingering ember glow.
+   */
   private async animateDestroyed(shipId: string, k: number): Promise<void> {
     const view = this.views.get(shipId)
     if (!view) return
     const pos = { x: view.world.x, y: view.world.y }
-    this.cameras.main.shake(280, 0.008)
-    this.spawnFlash(pos, 16, COLORS.white, 260 * k)
-    this.spawnRing(pos, 30, COLORS.torpedo, 620 * k)
-    this.scatterFragments(view, pos, k)
-    await this.wait(140 * k)
+    // Stage 1 — rapid white core flash.
+    this.cameras.main.shake(360, 0.011)
+    this.spawnFlash(pos, 18, COLORS.white, 240 * k)
+    await this.wait(150 * k)
     view.ship.alive = false
     view.ship.hull = 0
     this.redrawShip(view) // broken outline + debris under the fireball
-    await this.wait(120 * k)
-    this.spawnRing(pos, 38, COLORS.gold, 620 * k)
-    await this.wait(120 * k)
-    this.spawnRing(pos, 46, COLORS.red, 640 * k)
-    await this.wait(600 * k)
+    // Stage 2 — offset secondary blasts with expanding rings (display-only
+    // randomness: never the sim RNG).
+    for (let i = 0; i < 3; i++) {
+      const off = {
+        x: pos.x + (Math.random() - 0.5) * 4,
+        y: pos.y + (Math.random() - 0.5) * 4,
+      }
+      this.spawnFlash(off, 9 + i * 2, mix(COLORS.gold, COLORS.white, 0.4), 300 * k)
+      this.spawnRing(off, 26 + i * 9, i === 2 ? COLORS.red : COLORS.gold, 560 * k)
+      await this.wait(160 * k)
+    }
+    // Stage 3 — debris shards + lingering ember.
+    this.scatterFragments(view, pos, k)
+    this.spawnEmber(pos, k)
+    this.spawnRing(pos, 52, COLORS.torpedo, 700 * k)
+    await this.wait(620 * k)
   }
 
+  /** 8 glowing shards — real hull edges plus random slivers — tumbling out. */
   private scatterFragments(view: ShipView, pos: Vec2, k: number): void {
     if (this.ff) return
-    const frags = hullFragments(view.ship.faction, SHIP_PX)
+    const color = shipColor(view.ship.classId, view.ship.faction)
+    const segs: [Vec2, Vec2][] = hullFragments(view.ship.classId, view.ship.faction, SHIP_PX)
+    while (segs.length < 8) {
+      const cx = (Math.random() - 0.5) * 14
+      const cy = (Math.random() - 0.5) * 14
+      const ang = Math.random() * Math.PI * 2
+      const half = 2 + Math.random() * 3.5
+      segs.push([
+        { x: cx - Math.cos(ang) * half, y: cy - Math.sin(ang) * half },
+        { x: cx + Math.cos(ang) * half, y: cy + Math.sin(ang) * half },
+      ])
+    }
     const baseRot = headingToRotation(view.world.rot)
     const p = project(this.proj, pos)
-    frags.forEach((seg, i) => {
+    segs.forEach((seg, i) => {
       const g = this.add.graphics()
-      strokeGlowLine(g, seg[0].x, seg[0].y, seg[1].x, seg[1].y, factionColor(view.ship.faction), 0.8)
+      strokeGlowLine(g, seg[0].x, seg[0].y, seg[1].x, seg[1].y, color, 0.7)
       g.setPosition(p.x, p.y)
       g.setRotation(baseRot)
       this.fxLayer.add(g)
-      const ang = baseRot + (Math.PI * 2 * i) / frags.length + 0.5
+      const ang = baseRot + (Math.PI * 2 * i) / segs.length + Math.random() * 0.5
+      const dist = 22 + Math.random() * 30
       this.tweens.add({
         targets: g,
         props: {
-          x: p.x + Math.cos(ang) * (20 + i * 7),
-          y: p.y + Math.sin(ang) * (20 + i * 7),
-          rotation: baseRot + (i % 2 === 0 ? 1.6 : -1.3),
+          x: p.x + Math.cos(ang) * dist,
+          y: p.y + Math.sin(ang) * dist,
+          rotation: baseRot + (Math.random() - 0.5) * 6, // tumble
           alpha: 0,
         },
-        duration: 780 * k,
-        ease: 'Sine.easeOut',
+        duration: (850 + Math.random() * 350) * k,
+        ease: 'Cubic.easeOut',
         onComplete: () => g.destroy(),
       })
+    })
+  }
+
+  /** Lingering ember at a destruction site, guttering out over ~1.3s. */
+  private spawnEmber(pos: Vec2, k: number): void {
+    if (this.ff) return
+    const p = project(this.proj, pos)
+    const g = this.add.graphics()
+    this.fxLayer.add(g)
+    const anim = { t: 0 }
+    this.tweens.add({
+      targets: anim,
+      props: { t: 1 },
+      duration: 1300 * k,
+      ease: 'Sine.easeIn',
+      onUpdate: () => {
+        g.clear()
+        const fade = (1 - anim.t) * (0.75 + 0.25 * Math.sin(anim.t * 31)) // gutter
+        g.fillStyle(COLORS.torpedo, 0.22 * fade)
+        g.fillCircle(p.x, p.y, 10 - 4 * anim.t)
+        g.fillStyle(mix(COLORS.gold, COLORS.white, 0.3), 0.5 * fade)
+        g.fillCircle(p.x, p.y, 4 - 2 * anim.t)
+      },
+      onComplete: () => g.destroy(),
     })
   }
 
@@ -833,15 +1153,16 @@ export class TacticalScene extends Phaser.Scene {
     this.tweens.add({
       targets: g,
       props: { alpha: 0 },
-      duration: 400,
-      ease: 'Sine.easeIn',
+      duration: 450,
+      ease: 'Cubic.easeOut', // bright pop that settles instead of lingering
       onComplete: () => g.destroy(),
     })
   }
 
   /** Rising, fading damage/status text above a ship; stacks within a round. */
   private floatText(view: ShipView, text: string, color: number, k: number): void {
-    if (this.ff) return
+    // Hidden ships get no floats either — text over empty space is a position leak.
+    if (this.ff || this.isHiddenView(view)) return
     const slot = this.floatSlots.get(view.ship.id) ?? 0
     this.floatSlots.set(view.ship.id, slot + 1)
     const p = project(this.proj, view.world)
@@ -867,11 +1188,72 @@ export class TacticalScene extends Phaser.Scene {
 
 // ------------------------------------------------------------------- helpers
 
+/**
+ * Shield scale for the arc display. Unknown classIds (newer sim data than
+ * this render) fall back to the ship's own current shields, mirroring the
+ * silhouette fallback — the render must draw whatever the sim sends.
+ */
+function shieldMaxFor(ship: ShipState): number {
+  try {
+    return getShipClass(ship.classId).shieldMax
+  } catch {
+    return Math.max(1, ...Object.values(ship.shields))
+  }
+}
+
 function boardBounds(state: EncounterState): Bounds {
   const pts: Vec2[] = []
-  for (const ship of state.ships) if (!ship.warpedOut) pts.push(ship.pos)
+  for (const ship of state.ships) {
+    if (ship.warpedOut) continue
+    // Cloaked contacts must not steer the camera fit — that alone would leak
+    // their position. The player's own cloaked ghost still counts.
+    if (ship.cloaked && ship.id !== state.playerShipId) continue
+    pts.push(ship.pos)
+  }
   for (const torp of state.torpedoes) pts.push(torp.pos)
   return boundsOf(pts, WORLD_PAD)
+}
+
+/**
+ * Sound-cue mapping: the single place a replay event becomes cue names (src/
+ * audio SoundCue values). Weapon events pair their firing voice with exactly
+ * one impact voice — hull if armor gave, otherwise shield, never both.
+ */
+function cuesForEvent(ev: RoundEvent, shooterFaction: FactionId): string[] {
+  switch (ev.type) {
+    case 'phaser-fire':
+      if (!ev.hit) return ['miss-whoosh']
+      return [
+        shooterFaction === 'federation' ? 'phaser-fed' : 'disruptor',
+        ...impactCue(ev.shieldDamage, ev.hullDamage),
+      ]
+    case 'torpedo-hit':
+      return ['torpedo-hit', ...impactCue(ev.shieldDamage, ev.hullDamage)]
+    case 'torpedo-launch':
+      return ['torpedo-launch']
+    case 'ship-destroyed':
+      return ['explosion-ship']
+    case 'repair':
+      return ['repair']
+    case 'scan':
+      return ['scan']
+    case 'hail':
+      return ['hail']
+    case 'warp-out':
+      return ['warp-out']
+    case 'cloak':
+      return ['cloak']
+    case 'decloak':
+      return ['decloak']
+    default:
+      return []
+  }
+}
+
+function impactCue(shieldDamage: number, hullDamage: number): string[] {
+  if (hullDamage > 0) return ['hull-hit']
+  if (shieldDamage > 0) return ['shield-hit']
+  return []
 }
 
 /**
@@ -924,6 +1306,8 @@ const ANIMATED_EVENTS = new Set<RoundEvent['type']>([
   'phaser-fire',
   'subsystem-damaged',
   'warp-out',
+  'cloak',
+  'decloak',
   'ship-destroyed',
   'ship-disabled',
 ])
@@ -965,7 +1349,7 @@ function stepBaseMs(step: Step): number {
         case 'torpedo-expired':
           return 360
         case 'phaser-fire':
-          return 540
+          return 620
         case 'subsystem-damaged':
           return 330
         case 'repair':
@@ -976,8 +1360,12 @@ function stepBaseMs(step: Step): number {
           return 500
         case 'warp-out':
           return 700
+        case 'cloak':
+          return 800
+        case 'decloak':
+          return 760
         case 'ship-destroyed':
-          return 1050
+          return 1450
         case 'ship-disabled':
           return 700
         default:
