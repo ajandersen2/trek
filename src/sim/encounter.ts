@@ -31,6 +31,7 @@ import {
   MIN_HIT_CHANCE,
   PHASER_MAX_RANGE_DAMAGE,
   REPAIR_HP_PER_ROUND,
+  SCANNED_ACCURACY_BONUS,
   SENSOR_FACTOR_CAP,
   SWEEP_BASE_CHANCE,
   SWEEP_PER_SENSOR_POWER,
@@ -130,12 +131,15 @@ export function resolveRound(
   const orderFor = (shipId: string): OrderSet | undefined => orders.find((o) => o.shipId === shipId)
   const active = () => s.ships.filter((sh) => sh.alive && !sh.warpedOut)
 
-  // --- 1. Engineering repairs (ship order). No RNG.
+  // --- 1. Engineering repairs (ship order). No RNG. A subsystem wrecked to 0
+  // is beyond field triage for the rest of the fight (starbase work) — without
+  // this, a defender could revive its weapons forever and the disable victory
+  // (weapons AND engines at zero) was unreachable.
   for (const ship of active()) {
     const repair = orderFor(ship.id)?.engineering.repair
     if (!repair) continue
     const sub = ship.subsystems[repair]
-    if (sub.hp >= sub.maxHp) continue
+    if (sub.hp >= sub.maxHp || sub.hp <= 0) continue
     sub.hp = round2(Math.min(sub.maxHp, sub.hp + REPAIR_HP_PER_ROUND))
     events.push({ type: 'repair', shipId: ship.id, subsystem: repair, hp: sub.hp })
   }
@@ -464,11 +468,13 @@ export function resolveRound(
     const targetCls = getShipClass(targetSnap.classId)
     const evasion =
       EVASION_COEFF * Math.min(1, (speedThisRound.get(targetSnap.id) ?? 0) / targetCls.maxSpeed)
+    const solutionBonus = targetSnap.scanLevel >= 1 ? SCANNED_ACCURACY_BONUS : 0
     const acc = Math.max(
       MIN_HIT_CHANCE,
       Math.min(
         MAX_HIT_CHANCE,
-        BASE_PHASER_ACCURACY * (ACCURACY_SENSOR_FLOOR + ACCURACY_SENSOR_WEIGHT * sensorFactor) -
+        BASE_PHASER_ACCURACY * (ACCURACY_SENSOR_FLOOR + ACCURACY_SENSOR_WEIGHT * sensorFactor) +
+          solutionBonus -
           evasion,
       ),
     )
@@ -526,6 +532,10 @@ export function resolveRound(
 
   // --- 9. Shield regeneration (ship order). No RNG. Cloaked ships keep their
   // shields down — that's the price of the cloak.
+  // Regen is a per-round BUDGET routed to the weakest arc first (ties broken in
+  // fore/aft/port/starboard order). Healing all four arcs simultaneously made
+  // focused fire pointless — total healing quietly outpaced any single-arc
+  // damage stream and long fights stalemated.
   for (const ship of active()) {
     if (ship.cloaked || cloakingUp.has(ship.id)) {
       ship.shields = { fore: 0, aft: 0, port: 0, starboard: 0 }
@@ -533,9 +543,18 @@ export function resolveRound(
     }
     if (ship.subsystems.shields.hp <= 0) continue
     const cls = getShipClass(ship.classId)
-    const regen = cls.shieldRegen * systemFactor(ship, 'shields')
-    for (const arc of ['fore', 'aft', 'port', 'starboard'] as const) {
-      ship.shields[arc] = round2(Math.min(cls.shieldMax, ship.shields[arc] + regen))
+    let budget = cls.shieldRegen * systemFactor(ship, 'shields')
+    const arcs = ['fore', 'aft', 'port', 'starboard'] as const
+    while (budget > 0.005) {
+      let weakest: (typeof arcs)[number] | null = null
+      for (const arc of arcs) {
+        if (ship.shields[arc] >= cls.shieldMax) continue
+        if (weakest === null || ship.shields[arc] < ship.shields[weakest]) weakest = arc
+      }
+      if (weakest === null) break // all arcs full
+      const heal = Math.min(budget, cls.shieldMax - ship.shields[weakest])
+      ship.shields[weakest] = round2(ship.shields[weakest] + heal)
+      budget -= heal
     }
   }
 

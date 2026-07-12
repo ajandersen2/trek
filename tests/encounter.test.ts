@@ -264,6 +264,29 @@ describe('phasers', () => {
     expect(untouched).toBe(false)
   })
 
+  it('targeting a destroyed subsystem sends the full shot to the hull', () => {
+    const s = makeEncounter()
+    place(s, { x: 0, y: 0 }, 0, { x: 4, y: 0 }, 0)
+    const bop = s.ships[1]!
+    bop.shields = { fore: 0, aft: 0, port: 0, starboard: 0 }
+    bop.subsystems.shields.hp = 0
+    bop.subsystems.engines.hp = 0 // already dead
+    bop.scanLevel = 1
+    const orders: OrderSet[] = [
+      { ...idle('player'), tactical: { firePhasers: { targetId: 'bop', subsystem: 'engines' } } },
+      idle('bop'),
+    ]
+    for (let seed = 0; seed < 50; seed++) {
+      const { events } = resolveRound(s, orders, createRng(seed))
+      const fire = ofType(events, 'phaser-fire')[0]
+      if (!fire?.hit) continue
+      expect(fire.subsystemDamage).toBe(0)
+      expect(fire.hullDamage).toBeGreaterThan(10) // full damage, not the 30% split
+      return
+    }
+    throw new Error('no hitting seed found')
+  })
+
   it('WEGO simultaneity: a ship destroyed this round still fires', () => {
     const s = makeEncounter()
     place(s, { x: 0, y: 0 }, 0, { x: 3, y: 0 }, 8) // nose to nose, both in arc
@@ -380,7 +403,19 @@ describe('torpedoes', () => {
 // --- support systems ---------------------------------------------------------
 
 describe('repairs, scans, shields', () => {
-  it('engineering repairs restore subsystem hp and can revive a dead system', () => {
+  it('engineering repairs restore damaged subsystems', () => {
+    const s = makeEncounter()
+    s.ships[0]!.subsystems.engines.hp = 20
+    const orders: OrderSet[] = [
+      { ...idle('player'), engineering: { power: defaultPower(), repair: 'engines' } },
+      idle('bop'),
+    ]
+    const { state, events } = resolveRound(s, orders, createRng(1))
+    expect(state.ships[0]!.subsystems.engines.hp).toBe(28)
+    expect(ofType(events, 'repair')[0]?.subsystem).toBe('engines')
+  })
+
+  it('a subsystem wrecked to zero is beyond field repair for the encounter', () => {
     const s = makeEncounter()
     s.ships[0]!.subsystems.engines.hp = 0
     const orders: OrderSet[] = [
@@ -388,8 +423,8 @@ describe('repairs, scans, shields', () => {
       idle('bop'),
     ]
     const { state, events } = resolveRound(s, orders, createRng(1))
-    expect(state.ships[0]!.subsystems.engines.hp).toBe(12)
-    expect(ofType(events, 'repair')[0]?.subsystem).toBe('engines')
+    expect(state.ships[0]!.subsystems.engines.hp).toBe(0)
+    expect(ofType(events, 'repair')).toHaveLength(0)
   })
 
   it('scan marks the target and enables full readout', () => {
@@ -415,12 +450,15 @@ describe('repairs, scans, shields', () => {
     expect(state.ships[1]!.scanLevel).toBe(0)
   })
 
-  it('shields regenerate with power, capped at class max', () => {
+  it('shields regenerate weakest-arc-first from a budget, capped at class max', () => {
     const s = makeEncounter()
     s.ships[0]!.shields.fore = 10
+    s.ships[0]!.shields.port = 12
     const { state } = resolveRound(s, [idle('player'), idle('bop')], createRng(1))
-    expect(state.ships[0]!.shields.fore).toBe(16) // +6 regen at nominal power
-    expect(state.ships[0]!.shields.aft).toBe(40) // capped
+    // Budget 3 at nominal power, all routed into the weakest arc (fore).
+    expect(state.ships[0]!.shields.fore).toBe(13)
+    expect(state.ships[0]!.shields.port).toBe(12) // second-weakest waits its turn
+    expect(state.ships[0]!.shields.aft).toBe(40) // full arcs never soak budget
   })
 
   it('destroyed shield emitter collapses all arcs and stops regen', () => {

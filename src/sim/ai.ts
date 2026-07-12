@@ -17,9 +17,9 @@ import { roll, type Rng } from './rng'
 import type { Doctrine, EncounterState, OrderSet, ShipState, SubsystemId } from './types'
 
 const FLEE_HULL_FRACTION: Record<Doctrine, number> = {
-  knife: 0.3,
-  brawler: 0.2,
-  harasser: 0.4,
+  knife: 0.2,
+  brawler: 0.15,
+  harasser: 0.25,
 }
 
 export function klingonAI(state: EncounterState, shipId: string, rng: Rng): OrderSet {
@@ -220,7 +220,9 @@ function flee(self: ShipState, foe: ShipState, dist: number, shipId: string): Or
     },
     tactical: {},
     engineering: {
-      power: { engines: 4, shields: self.cloaked ? 0 : 2, weapons: 0, sensors: 0 },
+      // Everything to the engines — a running ship is a catchable ship if the
+      // pursuer commits (shields dark, hull exposed).
+      power: { engines: 4, shields: 0, weapons: 0, sensors: 0 },
       repair: pickRepair(self),
     },
   }
@@ -237,12 +239,12 @@ function bearsAfterTurn(self: ShipState, desiredHeading: number, steps: number):
   return Math.abs(headingDelta(predicted, desiredHeading)) <= steps
 }
 
-/** Repair priority: weapons, engines, shields, sensors — first below 60%. */
+/** Repair priority: weapons, engines, shields, sensors — first damaged-but-alive below 60%. */
 function pickRepair(self: ShipState): SubsystemId | null {
   const priority: SubsystemId[] = ['weapons', 'engines', 'shields', 'sensors']
   for (const sys of priority) {
     const sub = self.subsystems[sys]
-    if (sub.hp / sub.maxHp < 0.6) return sys
+    if (sub.hp > 0 && sub.hp / sub.maxHp < 0.6) return sys
   }
   return null
 }

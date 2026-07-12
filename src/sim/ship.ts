@@ -69,9 +69,13 @@ export function applyDamage(
   let hullDamage = 0
   let subsystemDamage = 0
   if (through > 0) {
-    if (targetSubsystem) {
-      subsystemDamage = through * 0.7
-      hullDamage = through * 0.3
+    // Targeting an already-destroyed subsystem wastes nothing: the beam just
+    // chews hull instead (otherwise most of the shot silently vanished).
+    // The 85/15 split keeps disable-focused fire meaningfully ahead of the
+    // defender's triage repair — non-lethal victories are a design pillar.
+    if (targetSubsystem && ship.subsystems[targetSubsystem].hp > 0) {
+      subsystemDamage = through * 0.85
+      hullDamage = through * 0.15
       damageSubsystem(ship, targetSubsystem, subsystemDamage, events)
     } else {
       hullDamage = through
