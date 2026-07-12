@@ -2,6 +2,8 @@
 // layer (Phaser), and the transport (local AI for M1). This is the only module
 // that owns mutable app state; everything else is render-from-state or pure.
 
+import { createAudio } from './audio/engine'
+import type { SoundCue } from './audio/api'
 import { getSystem } from './data/sectors'
 import { createLocalAITransport } from './net/localAI'
 import type { Transport } from './net/transport'
@@ -50,6 +52,34 @@ let transport: Transport | null = null
 let aiRng: Rng = createRng(0)
 let render: GameRender
 
+// --- audio -------------------------------------------------------------------
+const MUTE_KEY = 'starship-command-muted'
+const audio = createAudio()
+audio.setMuted(storageGet(MUTE_KEY) === '1')
+// AudioContext needs a user gesture: unlock on any first interaction.
+document.addEventListener('pointerdown', () => audio.unlock(), { capture: true })
+document.addEventListener('keydown', () => audio.unlock(), { capture: true })
+
+const VALID_CUES: ReadonlySet<string> = new Set<SoundCue>([
+  'phaser-fed',
+  'disruptor',
+  'torpedo-launch',
+  'torpedo-hit',
+  'shield-hit',
+  'hull-hit',
+  'explosion-small',
+  'explosion-ship',
+  'miss-whoosh',
+  'scan',
+  'hail',
+  'repair',
+  'warp-out',
+  'warp-travel',
+  'cloak',
+  'decloak',
+  'dock',
+])
+
 function screen(): Screen {
   if (atMenu || !game) return 'menu'
   if (game.mode === 'game-over') return 'game-over'
@@ -78,14 +108,16 @@ function slotLabel(slot: number): string | null {
 }
 
 function view(): ViewState {
-  return { screen: screen(), game, saveSlots: saveSlots(), selectedSystemId, busy }
+  return { screen: screen(), game, saveSlots: saveSlots(), selectedSystemId, busy, muted: audio.isMuted() }
 }
 
-/** Push current state to UI + render. Render is left alone mid-animation. */
+/** Push current state to UI + render + audio loops. Render is left alone mid-animation. */
 function refresh(): void {
   shell.render(view())
-  if (busy) return
   const s = screen()
+  audio.setAmbient(s === 'sector' || s === 'encounter')
+  audio.setRedAlert(s === 'encounter' && game?.encounter?.status === 'active')
+  if (busy) return
   if (s === 'sector' && game) {
     render.showSector(game)
     render.setSelectedSystem(selectedSystemId)
@@ -133,8 +165,8 @@ function resolveRoundWith(opponentOrders: OrderSet): void {
 }
 
 const callbacks: UICallbacks = {
-  onNewGame(seed) {
-    const { state, log } = newGame(seed)
+  onNewGame(seed, options) {
+    const { state, log } = newGame(seed, options)
     game = state
     atMenu = false
     selectedSystemId = null
@@ -181,6 +213,7 @@ const callbacks: UICallbacks = {
 
   onTravel(systemId) {
     if (!game || busy || game.mode !== 'sector') return
+    audio.play('warp-travel')
     const { state, log } = travelTo(game, systemId)
     game = state
     selectedSystemId = null
@@ -195,6 +228,7 @@ const callbacks: UICallbacks = {
 
   onDock() {
     if (!game || game.mode !== 'sector') return
+    audio.play('dock')
     const { state, log } = dock(game)
     game = state
     autosave()
@@ -212,6 +246,8 @@ const callbacks: UICallbacks = {
 
   onConcludeEncounter() {
     if (!game?.encounter || busy || game.encounter.status === 'active') return
+    const status = game.encounter.status
+    const resolvedBefore = game.missions.filter((m) => m.stage === 'resolved').length
     const { state, log } = concludeEncounter(game)
     game = state
     transport?.close()
@@ -219,11 +255,28 @@ const callbacks: UICallbacks = {
     autosave()
     refresh()
     shell.appendLog(log)
+    if (status === 'defeat') {
+      audio.stingers.defeat()
+    } else if (game.missions.filter((m) => m.stage === 'resolved').length > resolvedBefore) {
+      audio.stingers.missionComplete()
+    } else if (status === 'victory' || status === 'enemy-disabled' || status === 'enemy-withdrawn') {
+      audio.stingers.victory()
+    }
   },
 
   onMainMenu() {
     atMenu = true
     refresh()
+  },
+
+  onToggleMute() {
+    audio.setMuted(!audio.isMuted())
+    storageSet(MUTE_KEY, audio.isMuted() ? '1' : '0')
+    refresh()
+  },
+
+  onUiBeep(kind) {
+    audio.uiBeep(kind)
   },
 }
 
@@ -254,6 +307,9 @@ render = await createRender(shell.phaserParent, {
     if (screen() !== 'sector' || busy) return
     selectedSystemId = systemId === selectedSystemId ? null : systemId
     refresh()
+  },
+  onCue(cue) {
+    if (VALID_CUES.has(cue)) audio.play(cue as SoundCue)
   },
 })
 

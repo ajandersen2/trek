@@ -8,6 +8,12 @@ import type { EncounterState, RoundEvent } from '../sim/types'
 export interface RenderCallbacks {
   /** Player clicked a star system on the sector map. */
   onSystemSelected(systemId: string): void
+  /**
+   * Sound cue emitted at the matching moment of the round replay (beam drawn,
+   * torpedo impact, cloak shimmer...). Cue names are src/audio SoundCue values;
+   * the controller routes them. Optional: rendering must work without it.
+   */
+  onCue?(cue: string): void
 }
 
 export interface GameRender {
