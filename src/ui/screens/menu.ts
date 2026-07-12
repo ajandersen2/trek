@@ -3,7 +3,7 @@
 
 import type { ViewState } from '../api'
 import type { ScreenContent, ShellCtx } from '../context'
-import { btn, div, el, hint } from '../dom'
+import { btn, div, el, hint, parseSeed, seedRow } from '../dom'
 
 const LEFT_DECO: ReadonlyArray<readonly [string, string, number]> = [
   ['gold', 'LCARS 105', 2],
@@ -27,20 +27,6 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
     div('menu-rule'),
   )
 
-  const seedInput = el('input', 'seed-input')
-  seedInput.type = 'text'
-  seedInput.inputMode = 'numeric'
-  seedInput.placeholder = 'RANDOM'
-  seedInput.autocomplete = 'off'
-  seedInput.spellcheck = false
-  seedInput.value = ctx.ui.seedText
-  seedInput.setAttribute('aria-label', 'Mission seed (optional)')
-  seedInput.addEventListener('input', () => {
-    ctx.ui.seedText = seedInput.value
-  })
-  const seedRow = div('menu-seed')
-  seedRow.append(el('span', 'lbl', 'SEED'), seedInput)
-
   const actions = div('menu-actions')
   actions.append(
     btn(
@@ -48,8 +34,15 @@ export function menuScreen(view: ViewState, ctx: ShellCtx): ScreenContent {
       () => ctx.callbacks.onNewGame(parseSeed(ctx.ui.seedText), { permadeath: ctx.ui.permadeath }),
       { classes: 'primary execute wide', beep: 'confirm' },
     ),
-    seedRow,
+    seedRow(ctx.ui.seedText, 'Mission seed (optional)', (text) => {
+      ctx.ui.seedText = text
+    }),
     difficultyControl(ctx),
+    btn('VERSUS — HOT-SEAT DUEL', () => ctx.callbacks.onOpenSkirmishSetup(), {
+      classes: 'wide versus',
+      title: 'TWO CAPTAINS, ONE CONSOLE — HIDDEN WEGO ORDERS',
+      beep: 'confirm',
+    }),
   )
 
   const auto = view.saveSlots.find((s) => s.slot === 0)
@@ -116,17 +109,8 @@ function segOption(name: string, desc: string, selected: boolean, onPick: () => 
   return b
 }
 
-/** Optional numeric seed; anything blank/unparsable falls back to a random uint32. */
-function parseSeed(text: string): number {
-  const trimmed = text.trim()
-  if (trimmed) {
-    const n = Number(trimmed)
-    if (Number.isFinite(n)) return Math.abs(Math.floor(n)) >>> 0
-  }
-  return Math.floor(Math.random() * 4294967296)
-}
-
-function decoRail(blocks: ReadonlyArray<readonly [string, string, number]>): HTMLElement[] {
+/** Decorative LCARS rail blocks: [color, label, flex-grow]. Shared with the skirmish screens. */
+export function decoRail(blocks: ReadonlyArray<readonly [string, string, number]>): HTMLElement[] {
   const rail = div('deco')
   for (const [color, label, grow] of blocks) {
     const block = div('deco-block', label)

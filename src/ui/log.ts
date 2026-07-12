@@ -37,8 +37,11 @@ function bearingDegrees(index: number): string {
 
 /** Convert resolved-round events into readable captain's-log lines. */
 export function eventsToLog(events: RoundEvent[], view: ViewState): string[] {
-  const ships = view.game?.encounter?.ships ?? []
-  const playerId = view.game?.encounter?.playerShipId ?? view.game?.ship.id ?? 'player'
+  // Events come from whichever battle is running: the hot-seat skirmish duel
+  // (whose voice is seat A's frame — its ship is playerShipId) or the campaign.
+  const enc = view.skirmish?.encounter ?? view.game?.encounter ?? null
+  const ships = enc?.ships ?? []
+  const playerId = enc?.playerShipId ?? view.game?.ship.id ?? 'player'
   const shipOf = (id: string): ShipState | undefined =>
     ships.find((s) => s.id === id) ??
     (view.game && view.game.ship.id === id ? view.game.ship : undefined)

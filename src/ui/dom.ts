@@ -61,6 +61,32 @@ export function hint(text: string, warn = false): HTMLDivElement {
   return div(warn ? 'hint warn' : 'hint', text)
 }
 
+/** SEED label + free-text field row, shared by the campaign menu and skirmish setup. */
+export function seedRow(value: string, ariaLabel: string, onInput: (text: string) => void): HTMLDivElement {
+  const input = el('input', 'seed-input')
+  input.type = 'text'
+  input.inputMode = 'numeric'
+  input.placeholder = 'RANDOM'
+  input.autocomplete = 'off'
+  input.spellcheck = false
+  input.value = value
+  input.setAttribute('aria-label', ariaLabel)
+  input.addEventListener('input', () => onInput(input.value))
+  const row = div('menu-seed')
+  row.append(el('span', 'lbl', 'SEED'), input)
+  return row
+}
+
+/** Optional numeric seed; anything blank/unparsable falls back to a random uint32. */
+export function parseSeed(text: string): number {
+  const trimmed = text.trim()
+  if (trimmed) {
+    const n = Number(trimmed)
+    if (Number.isFinite(n)) return Math.abs(Math.floor(n)) >>> 0
+  }
+  return Math.floor(Math.random() * 4294967296)
+}
+
 /** One-decimal readout formatting: 11 → '11.0' (matches the sim's round2 values). */
 export function fmt1(n: number): string {
   return n.toFixed(1)

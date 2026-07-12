@@ -11,8 +11,11 @@ Built with TypeScript + Vite + Phaser 3, ships as **one self-contained HTML file
 
 - **`npm install && npm run dev`** — hot-reload dev server
 - **`npm run build`** — single-file build in `dist/index.html`
-- Season opener: answer the Veyra Colony distress call. What comes after depends on
-  how you answer it.
+- **Campaign**: answer the Veyra Colony distress call. What comes after depends on
+  how you answer it. Permadeath by default; Captain's Mercy if you'd rather be towed home.
+- **VERSUS — hot-seat duel**: two captains, one console. Pick from four ships (fly the
+  cloaked Bird-of-Prey yourself), give secret orders, hand the console over, watch the
+  round resolve together.
 
 ### Captain's crash course
 

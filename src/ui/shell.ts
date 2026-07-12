@@ -1,5 +1,5 @@
 // LCARS shell: owns the DOM chrome (frame, header, captain's log) and renders
-// one of the four screens into it from ViewState. Implements the Shell contract
+// one of the screens into it from ViewState. Implements the Shell contract
 // in api.ts — reads sim state, emits player intent via UICallbacks, mutates
 // nothing that belongs to the sim.
 
@@ -11,7 +11,7 @@ import type { MissionRecord } from '../sim/game'
 import { powerBudget, totalAllocated } from '../sim/power'
 import type { CreateShell, ViewState } from './api'
 import type { ScreenContent, ShellCtx, UiState } from './context'
-import { buildOrders, newDraft } from './draft'
+import { buildOrders, buildShipOrders, newDraft } from './draft'
 import { btn, el, setBeeper } from './dom'
 import { eventsToLog, lineClass } from './log'
 import { helpOverlay, logOverlay } from './overlays'
@@ -19,6 +19,7 @@ import { encounterScreen } from './screens/encounter'
 import { gameOverScreen } from './screens/gameover'
 import { menuScreen } from './screens/menu'
 import { sectorScreen } from './screens/sector'
+import { handoffScreen, skirmishScreen, skirmishSetupScreen } from './screens/skirmish'
 
 const MAX_LOG_LINES = 200
 
@@ -107,6 +108,11 @@ export const createShell: CreateShell = (root, callbacks) => {
     encounterKey: null,
     roundKey: null,
     overlay: null,
+    skirmishSeedText: '',
+    skirmishClassA: 'fed-cruiser', // setup defaults: the classic pairing
+    skirmishClassB: 'klingon-bop',
+    skirmishThrottle: null,
+    skirmishSent: null,
   }
   let lastView: ViewState | null = null
 
@@ -180,6 +186,11 @@ export const createShell: CreateShell = (root, callbacks) => {
   }
 
   function buildScreen(view: ViewState): ScreenContent {
+    // Skirmish screens can run with no campaign at all — route them before the
+    // "no game means menu" fallback.
+    if (view.screen === 'skirmish-setup') return skirmishSetupScreen(ctx)
+    if (view.screen === 'skirmish' && view.skirmish) return skirmishScreen(view, view.skirmish, ui.draft, ctx)
+    if (view.screen === 'handoff' && view.skirmish) return handoffScreen(view, view.skirmish, ctx)
     if (view.screen === 'menu' || !view.game) return menuScreen(view, ctx)
     if (view.screen === 'sector') return sectorScreen(view, view.game, ctx)
     if (view.screen === 'encounter' && view.game.encounter && ui.draft) {
@@ -194,6 +205,11 @@ export const createShell: CreateShell = (root, callbacks) => {
    * Keep the order draft alive across idempotent re-renders; rebuild it only
    * when the round (or the encounter itself, or the screen) changes. Throttle
    * carries between rounds of the same encounter; everything else resets.
+   *
+   * Skirmish drafts are keyed by seat + round: the key changes on every
+   * console handoff, so one captain's half-set orders are torn down before the
+   * other captain ever sees the screen, and each seat's fresh draft starts
+   * from its own ship's live power allocation.
    */
   function syncDraft(view: ViewState): void {
     const game = view.game
@@ -211,16 +227,43 @@ export const createShell: CreateShell = (root, callbacks) => {
         ui.encounterKey = encounterKey
         ui.roundKey = roundKey
       }
+    } else if (view.screen === 'skirmish' && view.skirmish && view.skirmish.encounter.status === 'active') {
+      const sk = view.skirmish
+      const seat = sk.activeSeat
+      const ship = sk.encounter.ships.find((s) => s.id === sk.shipIds[seat])
+      const roundKey = `skirmish:${seat}#${sk.round}`
+      if (ui.roundKey !== roundKey && ship) {
+        ui.skirmishThrottle ??= { A: 0, B: 0 }
+        ui.draft = newDraft(ship, ui.skirmishThrottle[seat])
+        ui.encounterKey = 'skirmish'
+        ui.roundKey = roundKey
+      }
+      // Throttle carries between the SAME captain's rounds (campaign parity).
+      if (ui.roundKey === roundKey && ui.draft && ui.skirmishThrottle) {
+        ui.skirmishThrottle[seat] = ui.draft.throttle
+      }
     } else {
       ui.draft = null
       ui.encounterKey = null
       ui.roundKey = null
+      // Handoff sits between the same duel's rounds — keep each seat's
+      // throttle memory; any other screen means the duel ended or was left.
+      if (view.screen !== 'handoff') ui.skirmishThrottle = null
     }
+    // A committed-orders lock is only meaningful while its round key is current.
+    if (ui.skirmishSent !== null && ui.skirmishSent !== ui.roundKey) ui.skirmishSent = null
   }
 
   function updateHeader(view: ViewState): void {
     const game = view.game
-    if (game) {
+    const onSkirmish =
+      view.screen === 'skirmish' || view.screen === 'handoff' || view.screen === 'skirmish-setup'
+    if (onSkirmish) {
+      // The duel lives outside the campaign clock — never show campaign intel here.
+      stardateEl.textContent = '—'
+      systemEl.textContent = 'DEEP SPACE'
+      missionEl.textContent = skirmishHeadline(view)
+    } else if (game) {
       stardateEl.textContent = game.galaxy.stardate.toFixed(1)
       systemEl.textContent = getSystem(game.galaxy.currentSystemId).name.toUpperCase()
       missionEl.textContent = missionHeadline(game.missions)
@@ -229,10 +272,20 @@ export const createShell: CreateShell = (root, callbacks) => {
       systemEl.textContent = '—'
       missionEl.textContent = 'STANDBY'
     }
+    // Long headlines (skirmish seat lines, mission titles) ellipsize under red
+    // alert — keep the full text reachable on hover.
+    missionEl.title = missionEl.textContent ?? ''
     muteBtn.textContent = view.muted ? '◄ ✕ MUTED' : '◄)) SOUND ON'
     muteBtn.setAttribute('aria-pressed', String(view.muted))
     muteBtn.classList.toggle('on', view.muted)
     logBtn.disabled = !game
+  }
+
+  function skirmishHeadline(view: ViewState): string {
+    const sk = view.skirmish
+    if (!sk) return 'SKIRMISH SETUP'
+    if (view.screen === 'handoff') return `SKIRMISH — ROUND ${sk.round} — HANDOFF TO CAPTAIN ${sk.activeSeat}`
+    return `SKIRMISH — ROUND ${sk.round} — CAPTAIN ${sk.activeSeat}: ${sk.names[sk.activeSeat].toUpperCase()}`
   }
 
   function missionHeadline(missions: MissionRecord[]): string {
@@ -248,6 +301,7 @@ export const createShell: CreateShell = (root, callbacks) => {
 
   function isRedAlert(view: ViewState): boolean {
     if (view.screen === 'game-over') return true
+    if (view.screen === 'skirmish') return view.skirmish?.encounter.status === 'active'
     return view.screen === 'encounter' && view.game?.encounter?.status === 'active'
   }
 
@@ -261,13 +315,17 @@ export const createShell: CreateShell = (root, callbacks) => {
     logEl.scrollTop = logEl.scrollHeight
   }
 
-  // --- keyboard shortcuts: SPACE/Enter execute, M mute, ESC closes overlays --
+  // --- keyboard shortcuts: SPACE/Enter execute/ready, M mute, ESC closes/backs --
   window.addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return
     if (e.key === 'Escape') {
       if (ui.overlay) {
         callbacks.onUiBeep('tap')
         closeOverlay()
+      } else if (lastView?.screen === 'skirmish-setup') {
+        // BACK parity: retreat from skirmish setup to the main menu.
+        callbacks.onUiBeep('tap')
+        callbacks.onLeaveSkirmish()
       }
       return
     }
@@ -281,17 +339,45 @@ export const createShell: CreateShell = (root, callbacks) => {
     }
     if (e.key === ' ' || e.key === 'Enter') {
       if (target instanceof HTMLButtonElement) return
-      if (ui.overlay || !lastView || lastView.screen !== 'encounter') return
-      e.preventDefault()
-      executeFromKeyboard(lastView)
+      if (ui.overlay || !lastView) return
+      if (lastView.screen === 'encounter' || lastView.screen === 'skirmish') {
+        e.preventDefault()
+        executeFromKeyboard(lastView)
+      } else if (lastView.screen === 'handoff') {
+        // READY parity: the next captain takes the console.
+        e.preventDefault()
+        if (lastView.busy) {
+          callbacks.onUiBeep('deny')
+        } else {
+          callbacks.onUiBeep('execute')
+          callbacks.onHandoffReady()
+        }
+      }
     }
   })
 
   /** Same rules and beeps as the EXECUTE ROUND button, minus the DOM. */
   function executeFromKeyboard(view: ViewState): void {
+    const draft = ui.draft
+    if (view.screen === 'skirmish') {
+      const sk = view.skirmish
+      if (!sk || !draft || sk.encounter.status !== 'active') return
+      const ship = sk.encounter.ships.find((s) => s.id === sk.shipIds[sk.activeSeat])
+      if (!ship) return
+      const sent = ui.skirmishSent !== null && ui.skirmishSent === ui.roundKey
+      if (view.busy || sent || totalAllocated(draft.power) > powerBudget(ship)) {
+        callbacks.onUiBeep('deny')
+        return
+      }
+      const opponentId = sk.shipIds[sk.activeSeat === 'A' ? 'B' : 'A']
+      const opponent = sk.encounter.ships.find((s) => s.id === opponentId) ?? null
+      callbacks.onUiBeep('execute')
+      ui.skirmishSent = ui.roundKey
+      callbacks.onSkirmishOrders(buildShipOrders(draft, ship, opponent))
+      return
+    }
     const game = view.game
     const enc = game?.encounter
-    const draft = ui.draft
     if (!game || !enc || !draft || enc.status !== 'active') return
     const player = enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship
     if (view.busy || totalAllocated(draft.power) > powerBudget(player)) {

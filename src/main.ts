@@ -385,8 +385,8 @@ const callbacks: UICallbacks = {
   },
 
   onLeaveSkirmish() {
-    if (!skirmish) return
-    skirmish.transport.close()
+    // Also the BACK path from the setup screen, where no duel exists yet.
+    skirmish?.transport.close()
     skirmish = null
     skirmishSetupOpen = false
     atMenu = true

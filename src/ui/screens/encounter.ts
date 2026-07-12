@@ -1,13 +1,15 @@
 // Encounter screen: power management on the left, station order cards on the
 // right, EXECUTE ROUND docked below them. All widgets render from the UI-owned
-// OrderDraft, so re-renders never lose in-progress orders.
+// OrderDraft, so re-renders never lose in-progress orders. The station/power
+// machinery (battlePanels, executeDock) is exported for the hot-seat skirmish
+// screen, which runs the same console for whichever captain holds the seat.
 
 import { getShipClass } from '../../data/ships'
 import { REPAIR_HP_PER_ROUND, WARP_OUT_MIN_RANGE } from '../../sim/constants'
 import type { GameState } from '../../sim/game'
 import { distance } from '../../sim/geometry'
 import { POWER_MAX_PER_SYSTEM, powerBudget, totalAllocated } from '../../sim/power'
-import type { EncounterState, EncounterStatus, ShipState, SubsystemId } from '../../sim/types'
+import type { EncounterStatus, ShipState, SubsystemId } from '../../sim/types'
 import { SUBSYSTEM_IDS } from '../../sim/types'
 import type { ViewState } from '../api'
 import type { ScreenContent, ShellCtx } from '../context'
@@ -45,6 +47,39 @@ export function encounterScreen(
   const player = enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship
   const enemy = enc.ships.find((s) => s.id !== enc.playerShipId) ?? null
   const locked = view.busy || enc.status !== 'active'
+  const { left, stations } = battlePanels(player, enemy, draft, locked, ctx)
+  const dock = executeDock(
+    enc.round,
+    view.busy,
+    totalAllocated(draft.power) > powerBudget(player),
+    enc.status === 'active',
+    () => ctx.callbacks.onExecuteRound(buildOrders(draft, game)),
+  )
+  const overlay = enc.status !== 'active' ? outcomeOverlay(enc.status, enemy, view.busy, ctx) : null
+  return { left, right: [stations, dock], overlay, overlayMode: 'dim' }
+}
+
+/** The two rails of one captain's battle console. */
+export interface BattlePanels {
+  /** Left rail: warp-core power draft + own-ship + target readouts. */
+  left: HTMLElement[]
+  /** Right rail scroll: helm / tactical / science / comms / engineering cards. */
+  stations: HTMLElement
+}
+
+/**
+ * Full order console for `player` against `enemy`, rendered from `draft`.
+ * Shared verbatim by the campaign encounter and the hot-seat skirmish — every
+ * control keys off the ordering ship (cloak, torpedoes, repair) and the
+ * opponent's scan state, so it works for any playable class on either side.
+ */
+export function battlePanels(
+  player: ShipState,
+  enemy: ShipState | null,
+  draft: OrderDraft,
+  locked: boolean,
+  ctx: ShellCtx,
+): BattlePanels {
   // A cloaked contact has no range solution — hide the number everywhere.
   const range =
     enemy && enemy.alive && !enemy.warpedOut && !enemy.cloaked
@@ -57,18 +92,15 @@ export function encounterScreen(
     panel('TARGET', 'red', enemy ? enemyStatusBody(enemy, range) : [hint('NO CONTACT')]),
   ]
 
-  const scroll = div('rail-scroll')
-  scroll.append(
+  const stations = div('rail-scroll')
+  stations.append(
     helmPanel(player, draft, locked, range, ctx),
     tacticalPanel(player, enemy, draft, locked, ctx),
     sciencePanel(enemy, draft, locked, ctx),
     commsPanel(enemy, draft, locked, ctx),
     engineeringPanel(player, draft, locked, ctx),
   )
-  const right = [scroll, executeDock(view, game, enc, player, draft, ctx)]
-
-  const overlay = enc.status !== 'active' ? outcomeOverlay(enc.status, enemy, view.busy, ctx) : null
-  return { left, right, overlay, overlayMode: 'dim' }
+  return { left, stations }
 }
 
 // --- left rail --------------------------------------------------------------
@@ -353,25 +385,24 @@ function engineeringPanel(
   ])
 }
 
-function executeDock(
-  view: ViewState,
-  game: GameState,
-  enc: EncounterState,
-  player: ShipState,
-  draft: OrderDraft,
-  ctx: ShellCtx,
+/**
+ * EXECUTE ROUND dock below the station rail. `resolving` covers any state
+ * where the round is out of the captain's hands (controller busy, or skirmish
+ * orders already committed); `active` is the encounter still running.
+ */
+export function executeDock(
+  round: number,
+  resolving: boolean,
+  over: boolean,
+  active: boolean,
+  onExecute: () => void,
 ): HTMLElement {
-  const over = totalAllocated(draft.power) > powerBudget(player)
   const dock = div('execute-dock')
-  const execute = btn(
-    view.busy ? 'RESOLVING…' : `EXECUTE ROUND ${enc.round}`,
-    () => ctx.callbacks.onExecuteRound(buildOrders(draft, game)),
-    {
-      classes: 'primary execute wide',
-      disabled: view.busy || over || enc.status !== 'active',
-      beep: 'execute',
-    },
-  )
+  const execute = btn(resolving ? 'RESOLVING…' : `EXECUTE ROUND ${round}`, onExecute, {
+    classes: 'primary execute wide',
+    disabled: resolving || over || !active,
+    beep: 'execute',
+  })
   // Disabled buttons swallow clicks silently; the wrapper still hears the
   // pointer (the disabled button is pointer-events: none) and denies audibly.
   const wrap = div('execute-wrap')
@@ -380,7 +411,7 @@ function executeDock(
     if (execute.disabled) beep('deny')
   })
   dock.append(wrap)
-  if (over && !view.busy) dock.append(hint('POWER OVER BUDGET — EXECUTE LOCKED', true))
+  if (over && !resolving) dock.append(hint('POWER OVER BUDGET — EXECUTE LOCKED', true))
   return dock
 }
 

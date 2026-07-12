@@ -46,19 +46,21 @@ export function newDraft(ship: ShipState, throttle: number): OrderDraft {
   }
 }
 
-/** Assemble the complete player OrderSet from the draft. */
-export function buildOrders(draft: OrderDraft, game: GameState): OrderSet {
-  const enc = game.encounter
-  const enemy = enc ? (enc.ships.find((s) => s.id !== enc.playerShipId) ?? null) : null
+/**
+ * Assemble a complete OrderSet from the draft for `ship` against `enemy`.
+ * Shared by the campaign encounter and the hot-seat skirmish (where the
+ * ordering ship is whichever seat holds the console, not GameState.ship).
+ */
+export function buildShipOrders(draft: OrderDraft, ship: ShipState, enemy: ShipState | null): OrderSet {
   const orders: OrderSet = {
-    shipId: game.ship.id,
+    shipId: ship.id,
     helm: { turn: draft.turn, throttle: draft.throttle, warpOut: draft.warpOut },
     tactical: {},
     engineering: { power: { ...draft.power }, repair: draft.repair },
   }
   // Ships without a cloaking device never send the order (the sim would ignore
   // it, but the wire format stays clean for lockstep hashing).
-  if (getShipClass(game.ship.classId).hasCloak) orders.helm.cloak = draft.cloak
+  if (getShipClass(ship.classId).hasCloak) orders.helm.cloak = draft.cloak
   if (enemy) {
     if (draft.firePhasers) {
       orders.tactical.firePhasers = { targetId: enemy.id, subsystem: draft.targetSubsystem }
@@ -68,4 +70,12 @@ export function buildOrders(draft: OrderDraft, game: GameState): OrderSet {
   }
   if (draft.hail) orders.comms = { hail: true }
   return orders
+}
+
+/** Assemble the complete player OrderSet from the draft (campaign encounter). */
+export function buildOrders(draft: OrderDraft, game: GameState): OrderSet {
+  const enc = game.encounter
+  const player = enc ? (enc.ships.find((s) => s.id === enc.playerShipId) ?? game.ship) : game.ship
+  const enemy = enc ? (enc.ships.find((s) => s.id !== enc.playerShipId) ?? null) : null
+  return buildShipOrders(draft, player, enemy)
 }
