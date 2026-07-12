@@ -33,6 +33,7 @@ export function createShip(
     torpedoes: cls.torpedoCapacity,
     scanLevel: 0,
     alive: true,
+    warpedOut: false,
   }
 }
 

@@ -39,6 +39,8 @@ export interface ShipState {
   /** 0 = unknown contact (hull bar only in UI), 1 = scanned (full readout, subsystem targeting). */
   scanLevel: number
   alive: boolean
+  /** Left the encounter via warp. Encounter-scoped; reset on encounter start. */
+  warpedOut: boolean
 }
 
 export interface TorpedoState {
@@ -49,6 +51,12 @@ export interface TorpedoState {
   heading: number
   /** Rounds of tracking left before it fizzles. */
   fuel: number
+  // Flight spec copied from the launcher's class at launch, so the torpedo
+  // keeps flying even if its owner is destroyed mid-flight.
+  speed: number
+  damage: number
+  proximity: number
+  turnRate: number
 }
 
 export type EncounterStatus =
@@ -66,6 +74,7 @@ export interface EncounterState {
   torpedoes: TorpedoState[]
   nextTorpedoId: number
   status: EncounterStatus
+  playerShipId: string
 }
 
 // ---------------------------------------------------------------------------
