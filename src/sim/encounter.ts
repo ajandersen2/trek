@@ -350,23 +350,36 @@ export function resolveRound(
     const targetLive = s.ships.find((t) => t.id === fire.targetId)
     const targetSnap = snapshot.ships.find((t) => t.id === fire.targetId)
     if (!targetLive || !targetSnap || !targetSnap.alive || targetSnap.warpedOut) continue
-    // Both ships moved simultaneously this round: resolve the shot at their
-    // closest approach along the two flight segments, so ships exchange fire
-    // as they pass instead of jousting hopelessly past each other.
+    // Both ships moved simultaneously this round: the shot happens at some
+    // moment during the pass, not at the endpoints. Sample the pass window
+    // (closest approach plus fixed fractions) and fire at the closest geometry
+    // where range AND firing arc are both satisfied — "shoot when your guns
+    // bear". Without this, narrow-arc ships overshooting a target always had
+    // it abeam at closest approach and could never fire.
     const shooterSeg = segments.get(ship.id)!
     const targetSeg = segments.get(targetSnap.id)!
-    const t = closestApproachT(shooterSeg.from, shooterSeg.to, targetSeg.from, targetSeg.to)
-    const shooterPos = lerp(shooterSeg.from, shooterSeg.to, t)
-    const targetPos = lerp(targetSeg.from, targetSeg.to, t)
-    const dist = distance(shooterPos, targetPos)
-    if (dist > cls.phaser.range) {
-      events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'range' })
+    const tStar = closestApproachT(shooterSeg.from, shooterSeg.to, targetSeg.from, targetSeg.to)
+    const candidates = [tStar, 0, 0.25, 0.5, 0.75, 1]
+    let best: { shooterPos: Vec2; targetPos: Vec2; dist: number } | null = null
+    let sawInRange = false
+    for (const t of candidates) {
+      const sp = lerp(shooterSeg.from, shooterSeg.to, t)
+      const tp = lerp(targetSeg.from, targetSeg.to, t)
+      const d = distance(sp, tp)
+      if (d > cls.phaser.range) continue
+      sawInRange = true
+      if (!inArc(sp, shipSnap.heading, tp, cls.phaser.cosHalfArc)) continue
+      if (!best || d < best.dist) best = { shooterPos: sp, targetPos: tp, dist: d }
+    }
+    if (!best) {
+      events.push({
+        type: 'phaser-blocked',
+        shooterId: ship.id,
+        reason: sawInRange ? 'arc' : 'range',
+      })
       continue
     }
-    if (!inArc(shooterPos, shipSnap.heading, targetPos, cls.phaser.cosHalfArc)) {
-      events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'arc' })
-      continue
-    }
+    const { shooterPos, targetPos, dist } = best
     // Accuracy: sensors help, target speed evades.
     const sensorFactor = Math.min(systemFactor(shipSnap, 'sensors'), SENSOR_FACTOR_CAP)
     const targetCls = getShipClass(targetSnap.classId)

@@ -23,6 +23,7 @@ Bridge commander sim. TypeScript + Vite + Phaser 3, builds to a single HTML file
 - `npm run dev` — hot-reload dev server (Jacob playtests here)
 - `npm test` — Vitest; sim tests must stay green before any commit
 - `npm run build` — single `dist/index.html` via vite-plugin-singlefile
+- `npm run smoke` — Playwright end-to-end against the built file (run build first); `--screens` dumps PNGs. Drives the game via `window.__sc` (view/callbacks/isBusy) — also handy for browser playtesting.
 
 ## Conventions
 
@@ -33,5 +34,7 @@ Bridge commander sim. TypeScript + Vite + Phaser 3, builds to a single HTML file
 
 ## Status
 
-- **Current milestone: M1** — LCARS UI shell, sector map, travel, power management, one combat encounter, save/load.
+- **M1 COMPLETE** — LCARS UI shell, 9-system sector map with travel + seeded events, per-round power management, WEGO combat vs AI Klingon Bird-of-Prey (authored mission "The Veyra Distress Call" + random patrol intercepts), versioned save/load (autosave, 3 slots, file export/import). 78 sim tests + Playwright smoke test green.
+- Combat lessons baked into the sim: phasers resolve at the best point along both ships' movement segments ("fire when guns bear during the pass") — endpoint-only checks made narrow-arc ships useless (see encounter.ts). No Math.sin/cos/atan2 anywhere in the sim (16-heading tables + dot products) for cross-engine lockstep determinism.
+- **Next: M2** — damage/repair depth, 3 enemy types, cloaking. (Shield arcs + subsystem targeting already landed in M1.)
 - Update this section as milestones complete (see DESIGN.md for M1–M6).

@@ -231,6 +231,39 @@ describe('phasers', () => {
     throw new Error('no hitting seed found')
   })
 
+  it('narrow-arc attacker can fire during an overshooting pass', () => {
+    const s = makeEncounter()
+    // BoP 4 east of a stationary player, slightly offset, facing west: at
+    // closest approach the player is abeam (outside the 90° disruptor arc),
+    // but early in the pass it is dead ahead — the shot must resolve there.
+    place(s, { x: 0, y: 0 }, 0, { x: 4, y: 1 }, 8)
+    const orders: OrderSet[] = [
+      idle('player'),
+      {
+        ...idle('bop'),
+        helm: { turn: 0, throttle: 2 }, // ~5.5 units: overshoots past the player
+        tactical: { firePhasers: { targetId: 'player', subsystem: null } },
+      },
+    ]
+    const { events } = resolveRound(s, orders, createRng(1))
+    expect(ofType(events, 'phaser-blocked')).toHaveLength(0)
+    expect(ofType(events, 'phaser-fire').filter((e) => e.shooterId === 'bop')).toHaveLength(1)
+  })
+
+  it('the AI hurts a stationary target within a dozen rounds', () => {
+    let s = makeEncounter(5)
+    const rng = createRng(41)
+    const aiRng = createRng(42)
+    for (let i = 0; i < 12 && s.status === 'active'; i++) {
+      s = resolveRound(s, [idle('player'), klingonAI(s, 'bop', aiRng)], rng).state
+    }
+    const player = s.ships[0]!
+    const shieldTotal =
+      player.shields.fore + player.shields.aft + player.shields.port + player.shields.starboard
+    const untouched = player.hull === player.maxHull && shieldTotal === 160
+    expect(untouched).toBe(false)
+  })
+
   it('WEGO simultaneity: a ship destroyed this round still fires', () => {
     const s = makeEncounter()
     place(s, { x: 0, y: 0 }, 0, { x: 3, y: 0 }, 8) // nose to nose, both in arc
