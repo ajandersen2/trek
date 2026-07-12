@@ -34,6 +34,8 @@ export function createShip(
     scanLevel: 0,
     alive: true,
     warpedOut: false,
+    cloaked: false,
+    cloakCooldown: 0,
   }
 }
 

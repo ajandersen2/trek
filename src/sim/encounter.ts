@@ -22,14 +22,19 @@ import {
   ACCURACY_SENSOR_FLOOR,
   ACCURACY_SENSOR_WEIGHT,
   BASE_PHASER_ACCURACY,
+  CLOAK_COOLDOWN_ROUNDS,
   COLLATERAL_CHANCE,
   COLLATERAL_RATIO,
   EVASION_COEFF,
+  GHOST_BEARING_RANGE,
   MAX_HIT_CHANCE,
   MIN_HIT_CHANCE,
   PHASER_MAX_RANGE_DAMAGE,
   REPAIR_HP_PER_ROUND,
   SENSOR_FACTOR_CAP,
+  SWEEP_BASE_CHANCE,
+  SWEEP_PER_SENSOR_POWER,
+  SWEEP_RANGE,
   THROTTLE_MAX,
   WARP_OUT_MIN_RANGE,
 } from './constants'
@@ -80,8 +85,14 @@ export function createEncounter(
   player.pos = { x: 0, y: 0 }
   player.heading = 0
   player.warpedOut = false
+  player.cloaked = false
+  player.cloakCooldown = 0
   foe.warpedOut = false
   foe.scanLevel = 0
+  foe.cloaked = false
+  // A cloak-capable enemy arrives having just decloaked (matches the log
+  // flavor and gives the player an opening round before it can vanish).
+  foe.cloakCooldown = getShipClass(foe.classId).hasCloak ? 1 : 0
   const dist = 18 + Math.floor(6 * nextFloat(rng))
   const lateral = Math.floor(13 * nextFloat(rng)) - 6
   foe.pos = { x: dist, y: lateral }
@@ -137,14 +148,40 @@ export function resolveRound(
     events.push({ type: 'power', shipId: ship.id, power: { ...ship.power }, budget })
   }
 
-  // --- 3. Science scans (ship order). No RNG (auto-success with working sensors).
+  // --- 3. Science scans (ship order). Against a visible target: auto-success
+  // with working sensors, no RNG. Against a cloaked target the scan becomes a
+  // tachyon sweep: one RNG draw per attempt; success forces an immediate
+  // decloak (the target moves visibly this round and had no fire orders — a
+  // naked round). A failed sweep in hint range leaks a rough bearing.
   for (const ship of active()) {
     const targetId = orderFor(ship.id)?.science?.scanTargetId
     if (!targetId) continue
     const target = s.ships.find((t) => t.id === targetId)
-    const success = !!target && target.alive && !target.warpedOut && systemFactor(ship, 'sensors') > 0
-    if (success && target) target.scanLevel = Math.max(target.scanLevel, 1)
-    events.push({ type: 'scan', shipId: ship.id, targetId, success })
+    const sensorsUp = systemFactor(ship, 'sensors') > 0
+    if (!target || !target.alive || target.warpedOut || !sensorsUp) {
+      events.push({ type: 'scan', shipId: ship.id, targetId, success: false, ghostBearing: null })
+      continue
+    }
+    if (!target.cloaked) {
+      target.scanLevel = Math.max(target.scanLevel, 1)
+      events.push({ type: 'scan', shipId: ship.id, targetId, success: true, ghostBearing: null })
+      continue
+    }
+    const dist = distance(ship.pos, target.pos)
+    const chance = SWEEP_BASE_CHANCE + SWEEP_PER_SENSOR_POWER * ship.power.sensors
+    if (dist <= SWEEP_RANGE && roll(rng, chance)) {
+      target.cloaked = false
+      target.cloakCooldown = CLOAK_COOLDOWN_ROUNDS
+      target.scanLevel = Math.max(target.scanLevel, 1)
+      events.push({ type: 'decloak', shipId: target.id, forced: true })
+      events.push({ type: 'scan', shipId: ship.id, targetId, success: true, ghostBearing: null })
+    } else {
+      const ghostBearing =
+        dist <= GHOST_BEARING_RANGE
+          ? (Math.round(headingToward(ship.pos, target.pos) / 2) * 2) % 16
+          : null
+      events.push({ type: 'scan', shipId: ship.id, targetId, success: false, ghostBearing })
+    }
   }
 
   // --- 4. Comms hails (ship order). RNG: one draw per hail (response line).
@@ -157,6 +194,31 @@ export function resolveRound(
         ? pick(rng, KLINGON_HAIL_RESPONSES)
         : '"Channel open. We are listening."'
     events.push({ type: 'hail', shipId: ship.id, targetId: foe.id, text })
+  }
+
+  // --- 4.5 Cloak transitions (ship order). No RNG. Decloaking is immediate —
+  // the ship can fire this round (decloak alpha strike). Engaging marks the
+  // ship as cloaking: weapons are down this round and the cloak completes at
+  // end of round (enemies get one last shot at the shimmering silhouette).
+  const cloakingUp = new Set<string>()
+  for (const ship of active()) {
+    const desired = orderFor(ship.id)?.helm.cloak
+    if (desired === undefined) continue
+    const cls = getShipClass(ship.classId)
+    if (!cls.hasCloak) continue // no device: silently ignored (UI never offers it)
+    if (ship.cloaked && desired === false) {
+      ship.cloaked = false
+      ship.cloakCooldown = CLOAK_COOLDOWN_ROUNDS
+      events.push({ type: 'decloak', shipId: ship.id, forced: false })
+    } else if (!ship.cloaked && desired === true) {
+      if (ship.subsystems.engines.hp <= 0) {
+        events.push({ type: 'cloak-blocked', shipId: ship.id, reason: 'engines' })
+      } else if (ship.cloakCooldown > 0) {
+        events.push({ type: 'cloak-blocked', shipId: ship.id, reason: 'cooldown' })
+      } else {
+        cloakingUp.add(ship.id)
+      }
+    }
   }
 
   // --- 5. Helm: compute all moves from pre-move state, then apply (simultaneous). No RNG.
@@ -237,7 +299,8 @@ export function resolveRound(
   const surviving: TorpedoState[] = []
   for (const torp of s.torpedoes) {
     const target = s.ships.find((t) => t.id === torp.targetId)
-    if (!target || !target.alive || target.warpedOut) {
+    if (!target || !target.alive || target.warpedOut || target.cloaked) {
+      // Dead, gone, or cloaked: the seeker head loses lock and self-destructs.
       events.push({ type: 'torpedo-expired', id: torp.id, pos: { ...torp.pos } })
       continue
     }
@@ -278,6 +341,10 @@ export function resolveRound(
     const launch = orderFor(ship.id)?.tactical.fireTorpedo
     if (!launch) continue
     const cls = getShipClass(ship.classId)
+    if (ship.cloaked || cloakingUp.has(ship.id)) {
+      events.push({ type: 'torpedo-blocked', shooterId: ship.id, reason: 'self-cloaked' })
+      continue
+    }
     if (ship.subsystems.weapons.hp <= 0) {
       events.push({ type: 'torpedo-blocked', shooterId: ship.id, reason: 'weapons-down' })
       continue
@@ -292,6 +359,10 @@ export function resolveRound(
     }
     const target = s.ships.find((t) => t.id === launch.targetId)
     if (!target || !target.alive || target.warpedOut) continue
+    if (target.cloaked) {
+      events.push({ type: 'torpedo-blocked', shooterId: ship.id, reason: 'target-cloaked' })
+      continue
+    }
     if (!inArc(ship.pos, ship.heading, target.pos, cls.torpedo.cosHalfArc)) {
       events.push({ type: 'torpedo-blocked', shooterId: ship.id, reason: 'arc' })
       continue
@@ -339,6 +410,10 @@ export function resolveRound(
     if (!fire) continue
     const shipSnap = getShip(snapshot, ship.id)
     const cls = getShipClass(ship.classId)
+    if (shipSnap.cloaked || cloakingUp.has(ship.id)) {
+      events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'self-cloaked' })
+      continue
+    }
     if (shipSnap.subsystems.weapons.hp <= 0) {
       events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'weapons-down' })
       continue
@@ -350,6 +425,10 @@ export function resolveRound(
     const targetLive = s.ships.find((t) => t.id === fire.targetId)
     const targetSnap = snapshot.ships.find((t) => t.id === fire.targetId)
     if (!targetLive || !targetSnap || !targetSnap.alive || targetSnap.warpedOut) continue
+    if (targetSnap.cloaked) {
+      events.push({ type: 'phaser-blocked', shooterId: ship.id, reason: 'target-cloaked' })
+      continue
+    }
     // Both ships moved simultaneously this round: the shot happens at some
     // moment during the pass, not at the endpoints. Sample the pass window
     // (closest approach plus fixed fractions) and fire at the closest geometry
@@ -445,8 +524,13 @@ export function resolveRound(
     if (!shot.subsystem) rollCollateral(shot.target, result.hullDamage, rng, events)
   }
 
-  // --- 9. Shield regeneration (ship order). No RNG.
+  // --- 9. Shield regeneration (ship order). No RNG. Cloaked ships keep their
+  // shields down — that's the price of the cloak.
   for (const ship of active()) {
+    if (ship.cloaked || cloakingUp.has(ship.id)) {
+      ship.shields = { fore: 0, aft: 0, port: 0, starboard: 0 }
+      continue
+    }
     if (ship.subsystems.shields.hp <= 0) continue
     const cls = getShipClass(ship.classId)
     const regen = cls.shieldRegen * systemFactor(ship, 'shields')
@@ -455,7 +539,25 @@ export function resolveRound(
     }
   }
 
-  // --- 10. Warp-outs complete, then status evaluation.
+  // --- 10. Cloaks complete, warp-outs complete, cooldowns tick, status.
+  for (const id of cloakingUp) {
+    const ship = getShip(s, id)
+    if (!ship.alive) continue
+    ship.cloaked = true
+    ship.shields = { fore: 0, aft: 0, port: 0, starboard: 0 }
+    events.push({ type: 'cloak', shipId: id })
+  }
+  for (const ship of s.ships) {
+    // A cloaked ship whose engines die loses the field immediately.
+    if (ship.cloaked && ship.subsystems.engines.hp <= 0) {
+      ship.cloaked = false
+      ship.cloakCooldown = CLOAK_COOLDOWN_ROUNDS
+      events.push({ type: 'decloak', shipId: ship.id, forced: true })
+    }
+    if (!ship.cloaked && ship.cloakCooldown > 0 && !cloakingUp.has(ship.id)) {
+      ship.cloakCooldown -= 1
+    }
+  }
   for (const id of warpingOut) {
     const ship = getShip(s, id)
     if (ship.alive) {

@@ -10,7 +10,30 @@ export const TRAVEL_FLAVOR: readonly string[] = [
   'A Federation survey buoy pings us: all quiet on this heading.',
 ]
 
-export const PATROL_SHIP_NAMES: readonly string[] = ['IKS Marauder', 'IKS Bloodwing', 'IKS Korvat']
+/** Random patrol composition: weighted class mix with name pools. */
+export interface PatrolEntry {
+  classId: string
+  names: readonly string[]
+  weight: number
+}
+
+export const PATROL_TABLE: readonly PatrolEntry[] = [
+  {
+    classId: 'klingon-raptor',
+    names: ['IKS Swiftwind', 'IKS Talon', 'IKS Vekma'],
+    weight: 5,
+  },
+  {
+    classId: 'klingon-bop',
+    names: ['IKS Marauder', 'IKS Bloodwing', 'IKS Korvat'],
+    weight: 3,
+  },
+  {
+    classId: 'klingon-ktinga',
+    names: ['IKS Gr\'oth', 'IKS Amar'],
+    weight: 2,
+  },
+]
 
 /** Chance per jump of a Klingon patrol intercept (not at starbases). */
 export const RANDOM_ENCOUNTER_CHANCE = 0.12

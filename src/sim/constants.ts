@@ -21,3 +21,15 @@ export const WARP_OUT_MIN_RANGE = 15
 export const REPAIR_HP_PER_ROUND = 12
 /** Impulse throttle steps (0..4 = quarters of max speed). */
 export const THROTTLE_MAX = 4
+
+// --- Cloaking device ---------------------------------------------------------
+/** Rounds after a decloak before the cloak can be re-engaged. */
+export const CLOAK_COOLDOWN_ROUNDS = 2
+/** Tachyon sweep: base chance to force a cloaked ship to decloak... */
+export const SWEEP_BASE_CHANCE = 0.25
+/** ...plus this much per point of the sweeping ship's sensor power. */
+export const SWEEP_PER_SENSOR_POWER = 0.08
+/** Sweeps only bite inside this range. */
+export const SWEEP_RANGE = 10
+/** Failed sweeps inside this range still yield a rough contact bearing. */
+export const GHOST_BEARING_RANGE = 14

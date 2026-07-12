@@ -41,6 +41,10 @@ export interface ShipState {
   alive: boolean
   /** Left the encounter via warp. Encounter-scoped; reset on encounter start. */
   warpedOut: boolean
+  /** Cloaked: untargetable, shields down, cannot fire. Class must have hasCloak. */
+  cloaked: boolean
+  /** Rounds until the cloak can be re-engaged after a decloak. */
+  cloakCooldown: number
 }
 
 export interface TorpedoState {
@@ -87,6 +91,13 @@ export interface HelmOrder {
   throttle: number
   /** Attempt to leave the encounter. Needs working engines and enough range. */
   warpOut?: boolean
+  /**
+   * Desired cloak state this round (absolute, not a toggle): true = engage or
+   * stay cloaked, false = decloak or stay visible. Omitted = keep current.
+   * Engaging blocks all weapons fire that round and completes at end of round;
+   * decloaking is immediate (the classic decloak-and-alpha-strike works).
+   */
+  cloak?: boolean
 }
 
 export interface TacticalOrder {
@@ -128,7 +139,21 @@ export type RoundEvent =
   | { type: 'helm'; shipId: string; from: Vec2; to: Vec2; headingFrom: number; headingTo: number }
   | { type: 'warp-out'; shipId: string }
   | { type: 'warp-out-failed'; shipId: string; reason: 'engines' | 'too-close' }
-  | { type: 'scan'; shipId: string; targetId: string; success: boolean }
+  | { type: 'cloak'; shipId: string }
+  | { type: 'decloak'; shipId: string; forced: boolean }
+  | { type: 'cloak-blocked'; shipId: string; reason: 'cooldown' | 'engines' }
+  | {
+      type: 'scan'
+      shipId: string
+      targetId: string
+      success: boolean
+      /**
+       * Failed tachyon sweep against a cloaked ship inside hint range: rough
+       * contact bearing quantized to 45° (heading index 0,2,4..14). Null when
+       * no hint. UI shows "faint distortion bearing ~090".
+       */
+      ghostBearing?: number | null
+    }
   | { type: 'hail'; shipId: string; targetId: string; text: string }
   | { type: 'torpedo-launch'; id: number; ownerId: string; targetId: string; pos: Vec2 }
   | { type: 'torpedo-move'; id: number; from: Vec2; to: Vec2 }
@@ -155,8 +180,16 @@ export type RoundEvent =
       targetedSubsystem: SubsystemId | null
       subsystemDamage: number
     }
-  | { type: 'phaser-blocked'; shooterId: string; reason: 'arc' | 'range' | 'weapons-down' | 'no-power' }
-  | { type: 'torpedo-blocked'; shooterId: string; reason: 'arc' | 'ammo' | 'weapons-down' | 'no-power' }
+  | {
+      type: 'phaser-blocked'
+      shooterId: string
+      reason: 'arc' | 'range' | 'weapons-down' | 'no-power' | 'target-cloaked' | 'self-cloaked'
+    }
+  | {
+      type: 'torpedo-blocked'
+      shooterId: string
+      reason: 'arc' | 'ammo' | 'weapons-down' | 'no-power' | 'target-cloaked' | 'self-cloaked'
+    }
   | { type: 'subsystem-damaged'; shipId: string; subsystem: SubsystemId; hp: number; disabled: boolean }
   | { type: 'ship-destroyed'; shipId: string }
   | { type: 'ship-disabled'; shipId: string }
@@ -172,6 +205,9 @@ export interface WeaponSpec {
   baseDamage: number
   range: number
 }
+
+/** AI combat doctrine; interpreted by src/sim/ai.ts. */
+export type Doctrine = 'knife' | 'brawler' | 'harasser'
 
 export interface ShipClass {
   id: string
@@ -190,4 +226,6 @@ export interface ShipClass {
   shieldMax: number
   shieldRegen: number
   subsystemMaxHp: number
+  hasCloak: boolean
+  doctrine: Doctrine
 }

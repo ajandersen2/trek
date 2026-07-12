@@ -23,8 +23,11 @@ describe('newGame', () => {
     const b = newGame(123)
     expect(a.state).toEqual(b.state)
     expect(a.state.galaxy.currentSystemId).toBe('sb4')
-    expect(a.state.mission.stage).toBe('active')
+    expect(a.state.missions[0]).toMatchObject({ defId: 'm1-veyra-distress', stage: 'active' })
+    expect(a.state.missions[1]).toMatchObject({ defId: 'm2-fek-lhr', stage: 'inactive' })
+    expect(a.state.settings.permadeath).toBe(true)
     expect(a.log.length).toBeGreaterThan(2)
+    expect(a.state.logArchive).toEqual(a.log)
   })
 })
 
@@ -51,7 +54,7 @@ describe('travel', () => {
     expect(s.mode).toBe('sector')
     s = travelTo(s, 'veyra').state
     expect(s.mode).toBe('encounter')
-    expect(s.encounterContext).toBe('mission')
+    expect(s.encounterContext).toEqual({ kind: 'mission', defId: 'm1-veyra-distress' })
     expect(s.encounter?.ships[1]?.name).toBe('IKS Vengeance')
   })
 
@@ -61,7 +64,7 @@ describe('travel', () => {
       let s = newGame(seed).state
       const step = travelTo(s, 'tellun')
       if (step.state.mode === 'encounter') {
-        expect(step.state.encounterContext).toBe('random')
+        expect(step.state.encounterContext).toEqual({ kind: 'random' })
         expect(step.state.encounter?.ships[1]?.faction).toBe('klingon')
         return
       }
@@ -125,9 +128,12 @@ describe('full M1 mission playthrough (sim-level integration)', () => {
       if (s.encounter!.status === 'defeat') continue
       const { state: after, log } = concludeEncounter(s)
       expect(after.mode).toBe('sector')
-      expect(after.mission.stage).toBe('resolved')
-      expect(['victory', 'enemy-disabled', 'enemy-withdrawn']).toContain(after.mission.outcome)
-      expect(log.join(' ')).toContain('Veyra')
+      const m1 = after.missions[0]!
+      expect(m1.stage).toBe('resolved')
+      expect(['victory', 'enemy-disabled', 'enemy-withdrawn']).toContain(m1.outcome)
+      // Resolving m1 activates the Fek'lhr hunt with its briefing.
+      expect(after.missions[1]!.stage).toBe('active')
+      expect(log.join(' ')).toContain("Fek'lhr")
       // Battle damage persists on the ship after the encounter.
       expect(after.ship.id).toBe('player')
       expect(after.encounter).toBeNull()
@@ -168,6 +174,8 @@ describe('defeat handling', () => {
       s.ship.hull = 1
       s.encounter!.ships[0]!.hull = 1
       s.encounter!.ships[0]!.shields = { fore: 0, aft: 0, port: 0, starboard: 0 }
+      // Emitters destroyed too, or per-round regen quietly refills the arcs.
+      s.encounter!.ships[0]!.subsystems.shields.hp = 0
       // Let the Klingon shoot a stationary, shieldless 1-hull target until it dies.
       const aiRng = createRng(9)
       let rounds = 0
