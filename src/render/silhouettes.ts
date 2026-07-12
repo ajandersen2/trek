@@ -86,6 +86,19 @@ const KTINGA_GREEN = 0x48b357 // deeper than the stock Klingon green
 const KTINGA_ACCENT = 0xe05548 // red-hot wing tips and torpedo tube
 const RAPTOR_GREEN = 0xa8e060 // lighter yellow-green
 
+/**
+ * Duel accents (hot-seat same-side matches): ships[1]'s hull glow mixes
+ * toward these so two like silhouettes stay tell-apart-able while ships[0]
+ * keeps the stock faction colors. Selection is the tactical scene's call.
+ */
+export const DUEL_ACCENTS: Record<FactionId, number> = {
+  federation: 0xffd27a, // warmer white-gold against the cool fed blue
+  klingon: 0x2fd6c4, // colder teal-green against the warm klingon greens
+}
+
+/** How far a duel accent pulls the hull color: subtle — the faction still reads. */
+const ACCENT_MIX = 0.55
+
 // Fixed debris scatter for wrecks (display-only, deterministic).
 const DEBRIS = [
   { x: 20, y: -6, r: 1.2 },
@@ -101,8 +114,12 @@ interface ShipShape {
   color: number
   /** Visual size multiplier against the ~30-unit base silhouette. */
   scale: number
-  /** Extra glowing detail lines, in the same pre-scaled local units. */
-  detail: (g: Gfx, s: number, alphaMul: number) => void
+  /**
+   * Extra glowing detail lines, in the same pre-scaled local units. `color`
+   * is the (possibly duel-accented) hull color; fixed hardware accents like
+   * the K't'inga's red wing tips stay their own color.
+   */
+  detail: (g: Gfx, s: number, alphaMul: number, color: number) => void
 }
 
 const SHAPES: Record<string, ShipShape> = {
@@ -110,26 +127,26 @@ const SHAPES: Record<string, ShipShape> = {
     hull: FED_HULL,
     color: COLORS.fed,
     scale: 1,
-    detail: (g, s, alphaMul) => {
-      strokeGlowCircle(g, 4.5 * s, 0, 6 * s, COLORS.fed, 0.7, alphaMul * 0.9)
-      strokeGlowLine(g, -6 * s, 6.8 * s, -14 * s, 6.8 * s, COLORS.fed, 0.7, alphaMul * 0.9)
-      strokeGlowLine(g, -6 * s, -6.8 * s, -14 * s, -6.8 * s, COLORS.fed, 0.7, alphaMul * 0.9)
+    detail: (g, s, alphaMul, color) => {
+      strokeGlowCircle(g, 4.5 * s, 0, 6 * s, color, 0.7, alphaMul * 0.9)
+      strokeGlowLine(g, -6 * s, 6.8 * s, -14 * s, 6.8 * s, color, 0.7, alphaMul * 0.9)
+      strokeGlowLine(g, -6 * s, -6.8 * s, -14 * s, -6.8 * s, color, 0.7, alphaMul * 0.9)
     },
   },
   'klingon-bop': {
     hull: BOP_HULL,
     color: COLORS.klingon,
     scale: 1,
-    detail: (g, s, alphaMul) => {
-      strokeGlowLine(g, -11 * s, 0, 9 * s, 0, COLORS.klingon, 0.5, alphaMul * 0.6)
+    detail: (g, s, alphaMul, color) => {
+      strokeGlowLine(g, -11 * s, 0, 9 * s, 0, color, 0.5, alphaMul * 0.6)
     },
   },
   'klingon-ktinga': {
     hull: KTINGA_HULL,
     color: KTINGA_GREEN,
     scale: 1.35,
-    detail: (g, s, alphaMul) => {
-      strokeGlowLine(g, -12 * s, 0, 12 * s, 0, KTINGA_GREEN, 0.5, alphaMul * 0.6)
+    detail: (g, s, alphaMul, color) => {
+      strokeGlowLine(g, -12 * s, 0, 12 * s, 0, color, 0.5, alphaMul * 0.6)
       // Red accents: wing tips + forward torpedo tube on the bulb.
       strokeGlowLine(g, -14 * s, 12.5 * s, -11.5 * s, 10 * s, KTINGA_ACCENT, 0.6, alphaMul * 0.85)
       strokeGlowLine(g, -14 * s, -12.5 * s, -11.5 * s, -10 * s, KTINGA_ACCENT, 0.6, alphaMul * 0.85)
@@ -140,11 +157,11 @@ const SHAPES: Record<string, ShipShape> = {
     hull: RAPTOR_HULL,
     color: RAPTOR_GREEN,
     scale: 0.8,
-    detail: (g, s, alphaMul) => {
-      strokeGlowLine(g, -10 * s, 0, 12 * s, 0, RAPTOR_GREEN, 0.45, alphaMul * 0.55)
+    detail: (g, s, alphaMul, color) => {
+      strokeGlowLine(g, -10 * s, 0, 12 * s, 0, color, 0.45, alphaMul * 0.55)
       // Cockpit chevron just behind the needle nose.
-      strokeGlowLine(g, 5 * s, 2 * s, 8.5 * s, 0, RAPTOR_GREEN, 0.5, alphaMul * 0.7)
-      strokeGlowLine(g, 5 * s, -2 * s, 8.5 * s, 0, RAPTOR_GREEN, 0.5, alphaMul * 0.7)
+      strokeGlowLine(g, 5 * s, 2 * s, 8.5 * s, 0, color, 0.5, alphaMul * 0.7)
+      strokeGlowLine(g, 5 * s, -2 * s, 8.5 * s, 0, color, 0.5, alphaMul * 0.7)
     },
   },
 }
@@ -165,28 +182,40 @@ export function beamColor(faction: FactionId): number {
   return faction === 'federation' ? COLORS.fedBeam : COLORS.klingonBeam
 }
 
-/** Hull tint for FX (fragments, warp streak) matching the drawn silhouette. */
-export function shipColor(classId: string, faction: FactionId): number {
-  return shapeFor(classId, faction).color
+/**
+ * Hull tint for FX (fragments, warp streak) matching the drawn silhouette.
+ * An `accent` (duel styling) pulls the base color partway toward it.
+ */
+export function shipColor(classId: string, faction: FactionId, accent?: number): number {
+  const base = shapeFor(classId, faction).color
+  return accent === undefined ? base : mix(base, accent, ACCENT_MIX)
 }
 
 /** Glowing ship outline. sizePx ≈ nose-to-tail length on screen at scale 1. */
-export function drawShip(g: Gfx, classId: string, faction: FactionId, sizePx: number, alphaMul = 1): void {
+export function drawShip(
+  g: Gfx,
+  classId: string,
+  faction: FactionId,
+  sizePx: number,
+  alphaMul = 1,
+  accent?: number,
+): void {
   const shape = shapeFor(classId, faction)
+  const color = shipColor(classId, faction, accent)
   const s = (sizePx * shape.scale) / 30
   const hull = scalePts(shape.hull, s)
-  g.fillStyle(shape.color, 0.07 * alphaMul)
+  g.fillStyle(color, 0.07 * alphaMul)
   g.fillPoints(hull, true)
-  strokeGlowPoly(g, hull, shape.color, 1, alphaMul)
-  shape.detail(g, s, alphaMul)
+  strokeGlowPoly(g, hull, color, 1, alphaMul)
+  shape.detail(g, s, alphaMul, color)
 }
 
 /** Destroyed ship: dim broken outline (every other hull edge) + debris dots. */
-export function drawWreck(g: Gfx, classId: string, faction: FactionId, sizePx: number): void {
+export function drawWreck(g: Gfx, classId: string, faction: FactionId, sizePx: number, accent?: number): void {
   const shape = shapeFor(classId, faction)
   const s = (sizePx * shape.scale) / 30
   const pts = scalePts(shape.hull, s)
-  const color = mix(shape.color, 0x555566, 0.65)
+  const color = mix(shipColor(classId, faction, accent), 0x555566, 0.65)
   g.lineStyle(1, color, 0.5)
   for (let i = 0; i < pts.length; i += 2) {
     const a = pts[i]!

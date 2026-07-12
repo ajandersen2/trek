@@ -6,6 +6,10 @@
 // Fog of war lives HERE, not in the sim: the sim emits true coordinates for
 // cloaked ships (events + finalState), and this layer is what keeps them off
 // the screen — silhouettes, movement, labels, camera fit, even launch flashes.
+// WHOSE fog applies is the POV (setPov, hot-seat M2.5): the POV ship ghosts
+// when cloaked, every other cloaked ship is absent, and a null POV (public
+// view, both captains watching) ghosts nothing. Until setPov is first called
+// it defaults to the board's playerShipId — campaign behavior, unchanged.
 
 import Phaser from 'phaser'
 import { getShipClass } from '../data/ships'
@@ -14,7 +18,7 @@ import { ARC_IDS, type EncounterState, type FactionId, type RoundEvent, type Shi
 import type { RenderCallbacks } from './api'
 import { COLORS, FONT_STACK, css, hullColor, mix } from './palette'
 import { drawBeam, fillGlowDot, strokeArcSegment, strokeGlowLine } from './fx'
-import { beamColor, drawShip, drawWreck, hullFragments, shipColor } from './silhouettes'
+import { DUEL_ACCENTS, beamColor, drawShip, drawWreck, hullFragments, shipColor } from './silhouettes'
 import { TACTICAL_NEBULA_HUES, drawNebula, makeNebula, type NebulaBlob } from './nebula'
 import {
   boundsOf,
@@ -36,7 +40,7 @@ const FIT_MARGIN = 36 // px kept clear inside the canvas edge
 const PROJ_TWEEN_MS = 400
 const ROUND_BUDGET_MS = 6500
 const GRID_STEP = 5 // sim units between range rings
-const GHOST_ALPHA = 0.35 // player's own cloaked ship
+const GHOST_ALPHA = 0.35 // the POV captain's own cloaked ship
 const GHOST_WEDGE_LEN = 12 // sim units: failed-sweep bearing hint reach
 const CLOAK_MS = 700
 const DECLOAK_MS = 600
@@ -67,6 +71,8 @@ interface ShipView {
   /** Render-owned deep copy; mutated only for display bookkeeping. */
   ship: ShipState
   shieldMax: number
+  /** Duel accent mixed into the hull glow (ships[1] of a same-side duel). */
+  accent: number | undefined
   container: Phaser.GameObjects.Container
   rig: Phaser.GameObjects.Container
   body: Phaser.GameObjects.Graphics
@@ -97,6 +103,12 @@ export class TacticalScene extends Phaser.Scene {
   private ff = false
   private pending = new Set<() => void>()
   private floatSlots = new Map<string, number>()
+  /**
+   * Hot-seat POV, tri-state (see GameRender.setPov): undefined = never set,
+   * fall back to the board's playerShipId (campaign); a ship id = that
+   * captain's seat; null = public view — every cloaked ship hidden, no ghosts.
+   */
+  private povOverride: string | null | undefined = undefined
 
   constructor(callbacks: RenderCallbacks) {
     super(TACTICAL_SCENE_KEY)
@@ -143,6 +155,29 @@ export class TacticalScene extends Phaser.Scene {
   /** Force any active replay to finish immediately (its promise still resolves). */
   cancelActiveRun(): void {
     if (this.run) this.fastForwardNow()
+  }
+
+  /**
+   * Change the POV (see povOverride). On a static board the cloak visibility,
+   * camera fit, and grid center re-evaluate immediately — a rebuild from the
+   * current board is cheap at this scale. Mid-replay the new POV applies to
+   * subsequent events and the end-of-round redraw settles the rest.
+   */
+  setPov(shipId: string | null): void {
+    if (this.povOverride === shipId) return
+    this.povOverride = shipId
+    if (this.board && !this.run) this.drawStatic(this.board, false)
+  }
+
+  /**
+   * Drop any POV override, restoring the playerShipId default. Called when
+   * the campaign sector map shows (a campaign-only surface): a hot-seat POV —
+   * main.ts parks it at null on skirmish exit — must not leak into a later
+   * campaign encounter, where it would hide the player's own privileged
+   * detail. No redraw: the next showEncounter draws under the default.
+   */
+  resetPovToDefault(): void {
+    this.povOverride = undefined
   }
 
   // ---------------------------------------------------------- async plumbing
@@ -209,9 +244,14 @@ export class TacticalScene extends Phaser.Scene {
     return view ? this.isHiddenView(view) : false
   }
 
-  /** Cloaked ships are absent from the display — except the player's own ghost. */
+  /** Cloaked ships are absent from the display — except the POV captain's ghost. */
   private isHiddenView(view: ShipView): boolean {
-    return view.ship.cloaked && view.ship.id !== this.board?.playerShipId
+    return view.ship.cloaked && view.ship.id !== this.povShipId()
+  }
+
+  /** Effective POV ship: the override if ever set, else the board's player ship. */
+  private povShipId(): string | null {
+    return this.povOverride === undefined ? (this.board?.playerShipId ?? null) : this.povOverride
   }
 
   // ------------------------------------------------------------- static draw
@@ -235,17 +275,18 @@ export class TacticalScene extends Phaser.Scene {
     this.clearViews()
     this.board = state
 
+    const pov = this.povShipId()
     const present = state.ships.filter((s) => !s.warpedOut)
-    // Grid center and camera fit only consider what the player can see:
-    // a cloaked enemy's true position must not steer the display.
-    const seen = present.filter((s) => !s.cloaked || s.id === state.playerShipId)
+    // Grid center and camera fit only consider what the POV captain can see:
+    // a cloaked contact's true position must not steer the display.
+    const seen = present.filter((s) => !s.cloaked || s.id === pov)
     if (seen.length > 0) {
       this.gridCenter = {
         x: seen.reduce((acc, s) => acc + s.pos.x, 0) / seen.length,
         y: seen.reduce((acc, s) => acc + s.pos.y, 0) / seen.length,
       }
     }
-    this.proj = this.fitTo(boardBounds(state))
+    this.proj = this.fitTo(boardBounds(state, pov))
     // Views exist for hidden ships too (invisible), silently tracking pose so
     // a later decloak materializes exactly where the sim says it is.
     for (const ship of present) this.views.set(ship.id, this.createShipView(ship))
@@ -286,8 +327,29 @@ export class TacticalScene extends Phaser.Scene {
     return boundsOf(pts, WORLD_PAD)
   }
 
+  /**
+   * Same-side duels (hot-seat mirrors: fed vs fed, klingon vs klingon, or the
+   * same class outright) tint ships[1] toward a distinct accent so two like
+   * silhouettes stay readable. Keyed off encounter index, never faction, so
+   * the treatment is deterministic however the seats pick their ships.
+   */
+  private duelAccent(shipId: string): number | undefined {
+    const a = this.board?.ships[0]
+    const b = this.board?.ships[1]
+    if (!a || !b || shipId !== b.id) return undefined
+    return a.classId === b.classId || a.faction === b.faction ? DUEL_ACCENTS[b.faction] : undefined
+  }
+
+  /** Do ships[0] and ships[1] share a class or faction? (duel label treatment) */
+  private isSameSideDuel(): boolean {
+    const a = this.board?.ships[0]
+    const b = this.board?.ships[1]
+    return !!a && !!b && (a.classId === b.classId || a.faction === b.faction)
+  }
+
   private createShipView(src: ShipState): ShipView {
     const ship = structuredClone(src)
+    const accent = this.duelAccent(ship.id)
     const body = this.add.graphics()
     const shieldsG = this.add.graphics()
     const rig = this.add.container(0, 0, [shieldsG, body])
@@ -296,15 +358,18 @@ export class TacticalScene extends Phaser.Scene {
       .text(0, SHIELD_RADIUS + 12, ship.name.toUpperCase(), {
         fontFamily: FONT_STACK,
         fontSize: '10px',
-        color: css(ship.faction === 'federation' ? COLORS.peach : mix(COLORS.klingon, COLORS.white, 0.25)),
+        color: css(labelColorFor(ship.faction, accent)),
       })
       .setOrigin(0.5, 0)
       .setLetterSpacing(1.2)
-      .setAlpha(0.9)
+      // Same-side duels lean on the name labels to tell captains apart: keep
+      // both at full strength there instead of the usual soft 0.9.
+      .setAlpha(this.isSameSideDuel() ? 1 : 0.9)
     const container = this.add.container(0, 0, [rig, hullG, label]).setDepth(2)
     const view: ShipView = {
       ship,
       shieldMax: shieldMaxFor(ship),
+      accent,
       container,
       rig,
       body,
@@ -322,18 +387,19 @@ export class TacticalScene extends Phaser.Scene {
     view.body.clear()
     view.shieldsG.clear()
     if (view.ship.alive) {
-      drawShip(view.body, view.ship.classId, view.ship.faction, SHIP_PX)
+      drawShip(view.body, view.ship.classId, view.ship.faction, SHIP_PX, 1, view.accent)
       this.drawShieldArcs(view)
     } else {
-      drawWreck(view.body, view.ship.classId, view.ship.faction, SHIP_PX)
+      drawWreck(view.body, view.ship.classId, view.ship.faction, SHIP_PX, view.accent)
     }
     this.drawHullBar(view)
   }
 
   /**
-   * Static cloak treatment. A hidden enemy is simply absent — no silhouette,
-   * hull bar, or label. The player's own cloaked ship stays as a ~35% ghost
-   * with a soft shimmer: the captain always knows where their own ship is.
+   * Static cloak treatment. A hidden ship is simply absent — no silhouette,
+   * hull bar, or label. The POV captain's own cloaked ship stays as a ~35%
+   * ghost with a soft shimmer: a captain always knows where their ship is.
+   * Under a public POV (null) nothing ghosts — every cloaked ship is absent.
    */
   private applyCloakLook(view: ShipView): void {
     this.tweens.killTweensOf(view.rig) // clear any prior shimmer before restyling
@@ -343,7 +409,7 @@ export class TacticalScene extends Phaser.Scene {
       view.container.setVisible(true).setAlpha(1)
       return
     }
-    if (view.ship.id === this.board?.playerShipId) {
+    if (view.ship.id === this.povShipId()) {
       view.container.setVisible(true).setAlpha(GHOST_ALPHA)
       this.tweens.add({
         targets: view.rig,
@@ -358,9 +424,14 @@ export class TacticalScene extends Phaser.Scene {
     }
   }
 
-  /** Enemy shield/subsystem detail is hidden until scanned (scanLevel >= 1). */
+  /**
+   * Shield/subsystem detail is privileged: the POV captain's own ship always
+   * shows it, anyone else's only once scanned (scanLevel >= 1). A public POV
+   * shows only scanned ships' detail — the intersection of what both captains
+   * are entitled to see, so a shared replay can't leak shield state.
+   */
   private shieldsVisible(view: ShipView): boolean {
-    return view.ship.alive && (view.ship.id === this.board?.playerShipId || view.ship.scanLevel >= 1)
+    return view.ship.alive && (view.ship.id === this.povShipId() || view.ship.scanLevel >= 1)
   }
 
   private drawShieldArcs(view: ShipView): void {
@@ -478,7 +549,7 @@ export class TacticalScene extends Phaser.Scene {
   /** Smooth ~400ms re-fit covering both current and end-of-round positions. */
   private tweenProjection(): void {
     if (!this.board) return
-    const target = this.fitTo(unionBounds(this.currentBounds(), boardBounds(this.board)))
+    const target = this.fitTo(unionBounds(this.currentBounds(), boardBounds(this.board, this.povShipId())))
     this.tweens.killTweensOf(this.proj)
     if (this.ff) {
       this.proj = target
@@ -884,7 +955,14 @@ export class TacticalScene extends Phaser.Scene {
     if (!this.ff) {
       const streak = this.add.graphics()
       this.fxLayer.add(streak)
-      drawBeam(streak, p0.x, p0.y, p1.x, p1.y, mix(shipColor(view.ship.classId, view.ship.faction), COLORS.white, 0.4))
+      drawBeam(
+        streak,
+        p0.x,
+        p0.y,
+        p1.x,
+        p1.y,
+        mix(shipColor(view.ship.classId, view.ship.faction, view.accent), COLORS.white, 0.4),
+      )
       this.tweens.add({
         targets: streak,
         props: { alpha: 0 },
@@ -925,7 +1003,7 @@ export class TacticalScene extends Phaser.Scene {
     const view = this.views.get(shipId)
     if (!view) return
     view.ship.cloaked = true
-    const endAlpha = shipId === this.board?.playerShipId ? GHOST_ALPHA : 0
+    const endAlpha = shipId === this.povShipId() ? GHOST_ALPHA : 0
     this.spawnCloakSlices(view, false, CLOAK_MS * k)
     const anim = { t: 0 }
     await this.tweenAsync({
@@ -955,7 +1033,7 @@ export class TacticalScene extends Phaser.Scene {
     this.tweens.killTweensOf(view.rig) // stop any ghost shimmer mid-oscillation
     view.rig.setAlpha(1)
     view.ship.cloaked = false
-    const fromAlpha = ev.shipId === this.board?.playerShipId ? GHOST_ALPHA : 0
+    const fromAlpha = ev.shipId === this.povShipId() ? GHOST_ALPHA : 0
     view.container.setVisible(true).setAlpha(fromAlpha)
     this.spawnCloakSlices(view, true, DECLOAK_MS * k)
     const anim = { t: 0 }
@@ -980,7 +1058,7 @@ export class TacticalScene extends Phaser.Scene {
     const rot = headingToRotation(view.world.rot)
     for (const dir of [-1, 1]) {
       const g = this.add.graphics()
-      drawShip(g, view.ship.classId, view.ship.faction, SHIP_PX, 0.45)
+      drawShip(g, view.ship.classId, view.ship.faction, SHIP_PX, 0.45, view.accent)
       g.setRotation(rot)
       g.setPosition(p.x + (converge ? dir * 10 : dir * 2), p.y + dir * 1.5)
       g.setAlpha(0.5)
@@ -1032,7 +1110,7 @@ export class TacticalScene extends Phaser.Scene {
   /** 8 glowing shards — real hull edges plus random slivers — tumbling out. */
   private scatterFragments(view: ShipView, pos: Vec2, k: number): void {
     if (this.ff) return
-    const color = shipColor(view.ship.classId, view.ship.faction)
+    const color = shipColor(view.ship.classId, view.ship.faction, view.accent)
     const segs: [Vec2, Vec2][] = hullFragments(view.ship.classId, view.ship.faction, SHIP_PX)
     while (segs.length < 8) {
       const cx = (Math.random() - 0.5) * 14
@@ -1201,13 +1279,19 @@ function shieldMaxFor(ship: ShipState): number {
   }
 }
 
-function boardBounds(state: EncounterState): Bounds {
+/** Name label color: faction tone, or the lifted duel accent for ships[1]. */
+function labelColorFor(faction: FactionId, accent: number | undefined): number {
+  if (accent !== undefined) return mix(accent, COLORS.white, 0.3)
+  return faction === 'federation' ? COLORS.peach : mix(COLORS.klingon, COLORS.white, 0.25)
+}
+
+function boardBounds(state: EncounterState, pov: string | null): Bounds {
   const pts: Vec2[] = []
   for (const ship of state.ships) {
     if (ship.warpedOut) continue
     // Cloaked contacts must not steer the camera fit — that alone would leak
-    // their position. The player's own cloaked ghost still counts.
-    if (ship.cloaked && ship.id !== state.playerShipId) continue
+    // their position. Only the POV captain's own cloaked ghost still counts.
+    if (ship.cloaked && ship.id !== pov) continue
     pts.push(ship.pos)
   }
   for (const torp of state.torpedoes) pts.push(torp.pos)

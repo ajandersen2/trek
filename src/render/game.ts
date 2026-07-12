@@ -8,6 +8,13 @@ import type { CreateRender, GameRender } from './api'
 import { SECTOR_SCENE_KEY, SectorScene } from './sectorScene'
 import { TACTICAL_SCENE_KEY, TacticalScene } from './tacticalScene'
 
+declare global {
+  interface Window {
+    /** Automation/debug handle; see the assignment in createRender. */
+    __scRender?: { game: Phaser.Game; sector: SectorScene; tactical: TacticalScene }
+  }
+}
+
 export const createRender: CreateRender = async (parent, callbacks) => {
   const sector = new SectorScene(callbacks)
   const tactical = new TacticalScene(callbacks) // replay emits onCue sound cues
@@ -56,6 +63,10 @@ export const createRender: CreateRender = async (parent, callbacks) => {
   const render: GameRender = {
     showSector(state) {
       tactical.cancelActiveRun()
+      // Campaign resumed (the sector map never shows during hot-seat): any
+      // skirmish POV override is stale here, so the playerShipId default is
+      // back for the next campaign encounter.
+      tactical.resetPovToDefault()
       sleep(TACTICAL_SCENE_KEY)
       wake(SECTOR_SCENE_KEY)
       sector.showSector(state)
@@ -79,6 +90,13 @@ export const createRender: CreateRender = async (parent, callbacks) => {
       sleep(SECTOR_SCENE_KEY)
       sleep(TACTICAL_SCENE_KEY)
     },
+    setPov(shipId) {
+      tactical.setPov(shipId)
+    },
   }
+  // Render-side automation handle (sibling of main.ts's window.__sc): lets the
+  // Playwright smoke drive assert what the viewport actually shows — cloak/POV
+  // visibility above all — without resorting to screenshot archaeology.
+  window.__scRender = { game, sector, tactical }
   return render
 }
