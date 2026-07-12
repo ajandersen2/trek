@@ -27,6 +27,37 @@ import { createHotseatTransport, type HotseatTransport } from './net/hotseat'
 import type { SaveSlotInfo, Screen, SeatId, UICallbacks, ViewState } from './ui/api'
 import { createShell } from './ui/shell'
 
+// The game must be able to boot into a bare <body>: some hosting wrappers
+// (e.g. the claude.ai artifact pipeline) sanitize empty elements out of the
+// document, which deletes a static <div id="app"></div>.
+function ensureRoot(): HTMLElement {
+  let root = document.getElementById('app')
+  if (!root) {
+    root = document.createElement('div')
+    root.id = 'app'
+    document.body.appendChild(root)
+  }
+  return root
+}
+
+// Boot failures paint onto the page — a black screen with no message is the
+// one unacceptable failure mode for a shareable single-file game.
+function showBootError(message: string): void {
+  const root = ensureRoot()
+  root.innerHTML = ''
+  const panel = document.createElement('pre')
+  panel.style.cssText =
+    'color:#cc6666;background:#000;padding:24px;margin:0;font:14px monospace;white-space:pre-wrap'
+  panel.textContent = `STARSHIP COMMAND — BOOT FAILURE\n\n${message}\n\nTry a hard refresh; if it persists, file it with this text.`
+  root.appendChild(panel)
+}
+window.addEventListener('error', (e) => {
+  if (!document.querySelector('.lcars-shell')) showBootError(String(e.message ?? e.error))
+})
+window.addEventListener('unhandledrejection', (e) => {
+  if (!document.querySelector('.lcars-shell')) showBootError(String(e.reason))
+})
+
 const AUTOSAVE_SLOT = 0
 const SLOT_COUNT = 4 // slot 0 = autosave, 1-3 manual
 const slotKey = (slot: number) => `starship-command-save-${slot}`
@@ -421,7 +452,7 @@ function resolveSkirmishRound(ordersB: OrderSet): void {
   })
 }
 
-const shell = createShell(document.getElementById('app')!, callbacks)
+const shell = createShell(ensureRoot(), callbacks)
 
 function loadSlot(slot: number): void {
   const json = localStorage.getItem(slotKey(slot))
